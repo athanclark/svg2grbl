@@ -1,0 +1,12 @@
+[package]
+name = "svg2grbl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
+env_logger = "0.11.10"
+log = "0.4.29"
+roxmltree = "0.21.1"
+svg2polylines = { path = "../svg2polylines" }
+svgtypes = "0.16.1"
