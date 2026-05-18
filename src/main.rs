@@ -1424,11 +1424,59 @@ fn shape_concentric_infill(
             if ipl.polyline.vertex_count() < 3 {
                 continue;
             }
+            // Cavalier emits closed polylines whose first and last vertex_data
+            // entries are joined by an implicit closing chord. On numerically
+            // tricky inputs that chord can be huge, even though the rest of the
+            // edges trace a fine offset — the polyline ends up as a thin sliver
+            // with one anomalous diagonal jump back to the start. Reject any
+            // polyline whose implicit closing edge is dramatically longer than
+            // its other edges.
+            if has_anomalous_closing_chord(&ipl.polyline) {
+                warn!("Discarding offset polyline with anomalous closing chord");
+                continue;
+            }
             rings.push(cc_polyline_to_polyline(&ipl.polyline));
         }
         current = next;
     }
     rings
+}
+
+/// `true` iff the implicit closing chord (`last vertex → first vertex`) is
+/// dramatically longer than any other edge in the loop. Well-formed offset
+/// polylines have edges of roughly similar length all the way around
+/// because cavalier's internal flattening tolerance is uniform; a closing
+/// chord several times longer than the longest other edge means the loop
+/// didn't actually close on itself and the gcode would draw a long stray
+/// diagonal across the work.
+fn has_anomalous_closing_chord(pl: &CcPolyline<f64>) -> bool {
+    let n = pl.vertex_count();
+    if n < 3 {
+        return false;
+    }
+    // Use the median internal edge length as the baseline. cavalier emits
+    // near-duplicate vertex pairs at slice joins, so the max edge can
+    // already be many times the typical edge — comparing against the
+    // median is more robust. A clean closed offset has close-chord length
+    // within a small factor of the median; a chord 6× the median is
+    // qualitatively out of family with the rest of the loop.
+    let mut edges: Vec<f64> = (0..n - 1)
+        .map(|i| {
+            let a = pl.at(i);
+            let b = pl.at(i + 1);
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .collect();
+    edges.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = edges[edges.len() / 2].max(1e-9);
+    let first = pl.at(0);
+    let last = pl.at(n - 1);
+    let cdx = first.x - last.x;
+    let cdy = first.y - last.y;
+    let close_len = (cdx * cdx + cdy * cdy).sqrt();
+    close_len > 6.0 * median
 }
 
 /// Straight-line scan-line infill of the polygon-with-holes. Each scan line
