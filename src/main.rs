@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
 };
 use svg2polylines::{CoordinatePair, Polyline, StyledPath};
-use svgtypes::{Length, LengthUnit, ViewBox};
+use svgtypes::{Length, LengthUnit, TransformListParser, TransformListToken, ViewBox};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -319,6 +319,137 @@ struct Gradient {
     stops: Vec<GradientStop>,
     units: GradientUnits,
     spread: SpreadMethod,
+    /// `gradientTransform` mapping from the gradient's local coordinate
+    /// system to the target system (mm for userSpaceOnUse, or bbox-unit for
+    /// objectBoundingBox). Identity if none was specified.
+    transform: Affine,
+}
+
+/// Minimal 2D affine transform. `p' = (a*x + c*y + e, b*x + d*y + f)`.
+#[derive(Debug, Clone, Copy)]
+struct Affine {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+}
+
+impl Affine {
+    const fn identity() -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    /// Compose `self * other`: applying the result to a point is equivalent
+    /// to applying `other` first, then `self`. This matches SVG's
+    /// left-to-right transform-list semantics: for `"translate(...) rotate(...)"`
+    /// we want translate-outer, rotate-inner, so we fold tokens by
+    /// `M = M * token`.
+    fn compose(&self, other: &Affine) -> Affine {
+        Affine {
+            a: self.a * other.a + self.c * other.b,
+            b: self.b * other.a + self.d * other.b,
+            c: self.a * other.c + self.c * other.d,
+            d: self.b * other.c + self.d * other.d,
+            e: self.a * other.e + self.c * other.f + self.e,
+            f: self.b * other.e + self.d * other.f + self.f,
+        }
+    }
+
+    /// Returns None for a singular (zero-determinant) transform.
+    fn invert(&self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        Some(Affine {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
+    }
+}
+
+/// Parse a CSS/SVG transform-list string (`"translate(10) rotate(45)"`,
+/// `"matrix(a b c d e f)"`, etc.) into a single affine.
+fn parse_gradient_transform(s: &str) -> Affine {
+    let mut m = Affine::identity();
+    for tok in TransformListParser::from(s) {
+        let tok = match tok {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Skipping malformed gradientTransform token: {}", e);
+                break;
+            }
+        };
+        let t = match tok {
+            TransformListToken::Matrix { a, b, c, d, e, f } => Affine { a, b, c, d, e, f },
+            TransformListToken::Translate { tx, ty } => Affine {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: tx,
+                f: ty,
+            },
+            TransformListToken::Scale { sx, sy } => Affine {
+                a: sx,
+                b: 0.0,
+                c: 0.0,
+                d: sy,
+                e: 0.0,
+                f: 0.0,
+            },
+            TransformListToken::Rotate { angle } => {
+                let r = angle.to_radians();
+                let (s, c) = (r.sin(), r.cos());
+                Affine {
+                    a: c,
+                    b: s,
+                    c: -s,
+                    d: c,
+                    e: 0.0,
+                    f: 0.0,
+                }
+            }
+            TransformListToken::SkewX { angle } => Affine {
+                a: 1.0,
+                b: 0.0,
+                c: angle.to_radians().tan(),
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            TransformListToken::SkewY { angle } => Affine {
+                a: 1.0,
+                b: angle.to_radians().tan(),
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
+        };
+        m = m.compose(&t);
+    }
+    m
 }
 
 type GradientRegistry = HashMap<String, Gradient>;
@@ -461,8 +592,8 @@ fn sample_gradient(g: &Gradient, env: &ColorEnv) -> Option<[f32; 4]> {
     if g.stops.is_empty() {
         return None;
     }
-    // Express the sample in the same units the gradient's geometric attrs
-    // are in.
+    // Express the sample in the target coord system (mm for userSpaceOnUse,
+    // bbox-unit for objectBoundingBox).
     let (sx, sy) = match g.units {
         GradientUnits::UserSpaceOnUse => (env.sample.x, env.sample.y),
         GradientUnits::ObjectBoundingBox => {
@@ -478,6 +609,14 @@ fn sample_gradient(g: &Gradient, env: &ColorEnv) -> Option<[f32; 4]> {
         }
     };
 
+    // gradientTransform maps gradient-local coords into the target system.
+    // To evaluate the gradient at a target-system sample, inverse-transform
+    // back to gradient-local first. If the transform is singular fall back
+    // to identity (logged warning at parse time would be ideal but we keep
+    // the sampler quiet).
+    let inv = g.transform.invert().unwrap_or_else(Affine::identity);
+    let (gx, gy) = inv.apply(sx, sy);
+
     let t = match g.shape {
         GradientShape::Linear { x1, y1, x2, y2 } => {
             let dx = x2 - x1;
@@ -486,25 +625,60 @@ fn sample_gradient(g: &Gradient, env: &ColorEnv) -> Option<[f32; 4]> {
             if len_sq <= 0.0 {
                 0.0
             } else {
-                ((sx - x1) * dx + (sy - y1) * dy) / len_sq
+                ((gx - x1) * dx + (gy - y1) * dy) / len_sq
             }
         }
         GradientShape::Radial { cx, cy, fx, fy, r } => {
-            if r <= 0.0 {
-                0.0
-            } else {
-                let ddx = sx - cx;
-                let ddy = sy - cy;
-                // Common case: focal point at center. Anything else gets
-                // approximated by the radial-from-center distance, with a
-                // warning at parse time.
-                let _ = (fx, fy);
-                (ddx * ddx + ddy * ddy).sqrt() / r
-            }
+            radial_offset(gx, gy, cx, cy, fx, fy, r)
         }
     };
     let t = apply_spread(t, g.spread);
     Some(interpolate_stops(&g.stops, t))
+}
+
+/// SVG 1.1 radial gradient evaluation: the gradient parameter at point `P`
+/// is `|FP| / |FQ|` where `F = (fx, fy)` is the focal point and `Q` is the
+/// intersection of the ray from `F` through `P` with the bounding circle
+/// `(cx, cy, r)`. If `F` lies outside the bounding circle, the spec says
+/// to move it onto the boundary — we approximate by clamping `F` to the
+/// boundary along the `C → F` direction before computing.
+fn radial_offset(px: f64, py: f64, cx: f64, cy: f64, mut fx: f64, mut fy: f64, r: f64) -> f64 {
+    if r <= 0.0 {
+        return 0.0;
+    }
+    // Clamp F to the boundary circle when it's outside.
+    let fcx = fx - cx;
+    let fcy = fy - cy;
+    let fc_len = (fcx * fcx + fcy * fcy).sqrt();
+    if fc_len > r {
+        let scale = (r * 0.999) / fc_len;
+        fx = cx + fcx * scale;
+        fy = cy + fcy * scale;
+    }
+    let dx = px - fx;
+    let dy = py - fy;
+    let a = dx * dx + dy * dy;
+    if a <= 0.0 {
+        // Sample point coincides with the focal point.
+        return 0.0;
+    }
+    let gx = cx - fx;
+    let gy = cy - fy;
+    let dg = dx * gx + dy * gy;
+    let gg = gx * gx + gy * gy;
+    let c_coef = gg - r * r; // <= 0 since F is inside (we clamped above)
+    let disc = dg * dg - a * c_coef;
+    if disc < 0.0 {
+        return 0.0;
+    }
+    // Take the positive root: the ray crosses the boundary in the +d
+    // direction at distance s = (dg + sqrt(disc))/a along (dx, dy). Since
+    // |FQ| = s * |d| and |FP| = |d|, the offset is 1/s.
+    let s_q = (dg + disc.sqrt()) / a;
+    if s_q <= 0.0 {
+        return 0.0;
+    }
+    1.0 / s_q
 }
 
 /// Convert a CSS color string into engraving power. SVG semantics:
@@ -597,7 +771,9 @@ struct RawGradient {
     fy: Option<f64>,
     r: Option<f64>,
     own_stops: Option<Vec<GradientStop>>,
-    has_transform: bool,
+    /// Raw `gradientTransform` string, parsed lazily during resolution so
+    /// child gradients can inherit a parent's transform via `href`.
+    transform: Option<String>,
 }
 
 /// Walk the SVG tree, collect every `<linearGradient>` / `<radialGradient>`
@@ -641,13 +817,7 @@ fn parse_gradients(
             "repeat" => Some(SpreadMethod::Repeat),
             _ => None,
         });
-        g.has_transform = node.attribute("gradientTransform").is_some();
-        if g.has_transform {
-            warn!(
-                "gradientTransform on '#{}' is not yet supported; sampling will ignore it",
-                id
-            );
-        }
+        g.transform = node.attribute("gradientTransform").map(str::to_string);
         let parse_num = |s: &str| -> Option<f64> {
             if let Some(p) = s.strip_suffix('%') {
                 p.trim().parse::<f64>().ok().map(|n| n / 100.0)
@@ -671,32 +841,58 @@ fn parse_gradients(
         raw.insert(id, g);
     }
 
-    // Second pass: resolve href to inherit stops/shape attrs. We only
-    // follow one hop (chains of refs would need a topological walk; warn
-    // if we encounter one we can't resolve).
+    // Second pass: collapse each gradient's href chain into a single
+    // RawGradient by following parents iteratively. Per SVG 1.1, every
+    // gradient attribute (including gradientTransform) inherits via href.
+    // We use `Option::or` so this-set values win over inherited ones, and
+    // a `visited` set to break cycles.
     let original = raw.clone();
-    for (_, g) in raw.iter_mut() {
-        if let Some(parent_id) = g.href.clone() {
-            if let Some(parent) = original.get(&parent_id) {
-                if g.own_stops.is_none() {
-                    g.own_stops = parent.own_stops.clone();
-                }
-                if g.units.is_none() {
-                    g.units = parent.units;
-                }
-                if g.spread.is_none() {
-                    g.spread = parent.spread;
-                }
-                g.x1 = g.x1.or(parent.x1);
-                g.y1 = g.y1.or(parent.y1);
-                g.x2 = g.x2.or(parent.x2);
-                g.y2 = g.y2.or(parent.y2);
-                g.cx = g.cx.or(parent.cx);
-                g.cy = g.cy.or(parent.cy);
-                g.fx = g.fx.or(parent.fx);
-                g.fy = g.fy.or(parent.fy);
-                g.r = g.r.or(parent.r);
+    let ids: Vec<String> = raw.keys().cloned().collect();
+    for id in &ids {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(id.clone());
+        let mut next_href = raw.get(id).and_then(|g| g.href.clone());
+        while let Some(parent_id) = next_href {
+            if !visited.insert(parent_id.clone()) {
+                warn!(
+                    "Cycle in gradient href chain involving '#{}'; stopping resolution",
+                    parent_id
+                );
+                break;
             }
+            let parent = match original.get(&parent_id) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "Gradient '#{}' references unknown '#{}'; stopping resolution",
+                        id, parent_id
+                    );
+                    break;
+                }
+            };
+            let g = raw.get_mut(id).expect("id from keys");
+            if g.own_stops.is_none() {
+                g.own_stops = parent.own_stops.clone();
+            }
+            if g.units.is_none() {
+                g.units = parent.units;
+            }
+            if g.spread.is_none() {
+                g.spread = parent.spread;
+            }
+            if g.transform.is_none() {
+                g.transform = parent.transform.clone();
+            }
+            g.x1 = g.x1.or(parent.x1);
+            g.y1 = g.y1.or(parent.y1);
+            g.x2 = g.x2.or(parent.x2);
+            g.y2 = g.y2.or(parent.y2);
+            g.cx = g.cx.or(parent.cx);
+            g.cy = g.cy.or(parent.cy);
+            g.fx = g.fx.or(parent.fx);
+            g.fy = g.fy.or(parent.fy);
+            g.r = g.r.or(parent.r);
+            next_href = parent.href.clone();
         }
     }
 
@@ -724,12 +920,12 @@ fn parse_gradients(
         );
         let (cx, cy, r) = (g.cx.unwrap_or(0.5), g.cy.unwrap_or(0.5), g.r.unwrap_or(0.5));
         let (fx, fy) = (g.fx.unwrap_or(cx), g.fy.unwrap_or(cy));
-        if (fx - cx).abs() > 1e-9 || (fy - cy).abs() > 1e-9 {
-            warn!(
-                "Radial gradient '#{}' has offset focal point; approximating with center-only distance",
-                id
-            );
-        }
+
+        let transform = g
+            .transform
+            .as_deref()
+            .map(parse_gradient_transform)
+            .unwrap_or_else(Affine::identity);
 
         // Convert coords to mm when in user space, matching what we do to
         // polylines elsewhere.
@@ -774,6 +970,7 @@ fn parse_gradients(
                 stops,
                 units,
                 spread,
+                transform,
             },
         );
     }
