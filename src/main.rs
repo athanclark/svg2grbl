@@ -1387,14 +1387,24 @@ fn shape_concentric_infill(
         if next.ccw_plines.is_empty() && next.cw_plines.is_empty() {
             break;
         }
-        // Sanity-check the new shape's vertices: anything outside the
-        // input's bbox (with small slack) means cavalier produced a
-        // runaway offset on a numerically tricky input; bail.
+        // Sanity-check the new shape's vertices: anything NaN/infinite, or
+        // outside the input's bbox (with small slack), means cavalier
+        // produced a runaway offset on a numerically tricky input. We must
+        // check `!is_finite()` explicitly because NaN comparisons return
+        // false for both `<` and `>`, so a NaN vertex would otherwise be
+        // passed back as the next iteration's input and trip an `assert!`
+        // deep inside cavalier's spatial-index builder.
         let mut runaway = false;
         for ipl in next.ccw_plines.iter().chain(next.cw_plines.iter()) {
             for i in 0..ipl.polyline.vertex_count() {
                 let v = ipl.polyline.at(i);
-                if v.x < lo_x || v.x > hi_x || v.y < lo_y || v.y > hi_y {
+                let bad = !v.x.is_finite()
+                    || !v.y.is_finite()
+                    || v.x < lo_x
+                    || v.x > hi_x
+                    || v.y < lo_y
+                    || v.y > hi_y;
+                if bad {
                     runaway = true;
                     break;
                 }
@@ -1404,7 +1414,7 @@ fn shape_concentric_infill(
             }
         }
         if runaway {
-            warn!("Discarding degenerate offset iteration with out-of-bbox vertices");
+            warn!("Discarding degenerate offset iteration with bad vertices");
             break;
         }
         for ipl in next.ccw_plines.iter().chain(next.cw_plines.iter()) {
