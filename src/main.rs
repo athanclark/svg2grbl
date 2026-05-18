@@ -1,8 +1,9 @@
 use cavalier_contours::polyline::{
     PlineSource, PlineSourceMut, PlineVertex, Polyline as CcPolyline,
 };
+use cavalier_contours::shape_algorithms::{Shape, ShapeOffsetOptions};
 use clap::{ArgAction, Parser};
-use log::{info, warn};
+use log::info;
 use roxmltree::Document;
 use std::str::FromStr;
 use std::{
@@ -10,7 +11,7 @@ use std::{
     io::{self, Read},
     path::PathBuf,
 };
-use svg2polylines::{CoordinatePair, Polyline, StyledPolyline};
+use svg2polylines::{CoordinatePair, Polyline, StyledPath};
 use svgtypes::{Length, LengthUnit, ViewBox};
 
 #[derive(Parser, Debug)]
@@ -52,8 +53,10 @@ struct Args {
     #[arg(long, default_value_t = 16.0)]
     font_size: f64,
 
-    /// Spacing (in mm) between concentric infill passes for filled, convex paths.
-    /// If unset, no infill is generated.
+    /// Spacing (in mm) between concentric infill passes for filled paths.
+    /// Holes are detected via subpath containment (so glyphs with holes work
+    /// correctly), and the offset is robust on non-convex outlines. If unset,
+    /// no infill is generated.
     #[arg(long)]
     infill: Option<f64>,
 
@@ -90,7 +93,7 @@ fn main() -> io::Result<()> {
     info!("Extracting height");
     let height = svg_node.attribute("height").map(|h| length_to_mm(h, args.dpi, args.font_size)).transpose().map_err(io::Error::other).map(|h| h.unwrap_or(viewbox.h))?;
 
-    let styled: Vec<StyledPolyline> = svg2polylines::parse_styled(
+    let paths: Vec<StyledPath> = svg2polylines::parse_paths(
         &svg_buf,
         args.tolerance,
         args.preprocess,
@@ -105,29 +108,29 @@ fn main() -> io::Result<()> {
         "G28".to_owned(), // move to stored home
     ];
 
-    // Normalize coordinates of every polyline to millimeters via viewBox/width/height.
-    let styled: Vec<StyledPolyline> = styled
+    // Normalize coordinates of every polyline within every path to mm.
+    let normalize = |p: CoordinatePair| CoordinatePair {
+        x: (p.x / viewbox.w) * width,
+        y: (p.y / viewbox.h) * height,
+    };
+    let paths: Vec<StyledPath> = paths
         .into_iter()
-        .map(|sp| StyledPolyline {
-            polyline: Polyline::from_vec(
-                sp.polyline
-                    .unwrap()
-                    .into_iter()
-                    .map(|p| CoordinatePair {
-                        x: (p.x / viewbox.w) * width,
-                        y: (p.y / viewbox.h) * height,
-                    })
-                    .collect(),
-            ),
+        .map(|sp| StyledPath {
+            polylines: sp
+                .polylines
+                .into_iter()
+                .map(|pl| Polyline::from_vec(pl.unwrap().into_iter().map(normalize).collect()))
+                .collect(),
             style: sp.style,
         })
         .collect();
 
-    // For filled convex polylines, expand each into [outline, ring_1, ring_2, ...].
-    // Non-convex filled paths emit a warning and pass through unchanged.
-    let polylines: Vec<Polyline> = styled
+    // Expand each StyledPath into the polylines to engrave. For filled paths
+    // with --infill set, this includes the outline(s), any hole boundaries,
+    // and the concentric infill rings of the polygon-with-holes.
+    let polylines: Vec<Polyline> = paths
         .into_iter()
-        .flat_map(|sp| expand_with_infill(sp, args.infill))
+        .flat_map(|sp| expand_path_with_infill(sp, args.infill))
         .collect();
 
     let points: Vec<CoordinatePair> = polylines
@@ -195,73 +198,96 @@ fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<V
     Ok(gcodes)
 }
 
-/// Expand a styled polyline into its outline plus, if filled/convex/closed and
-/// `infill_step` is set, a sequence of inward concentric infill rings.
-fn expand_with_infill(sp: StyledPolyline, infill_step: Option<f64>) -> Vec<Polyline> {
-    let outline = sp.polyline;
-    let step = match infill_step {
-        Some(s) if s > 0.0 => s,
-        _ => return vec![outline],
-    };
-    if !sp.style.has_fill() {
-        return vec![outline];
+/// Expand a styled `<path>` into the polylines to engrave. For filled paths
+/// with `infill_step` set, this includes the outline of every subpath plus
+/// concentric infill rings of the polygon-with-holes (holes are detected by
+/// containment within the same `<path>`). For unfilled paths, or when no
+/// step is given, the subpath outlines pass through unchanged.
+fn expand_path_with_infill(sp: StyledPath, infill_step: Option<f64>) -> Vec<Polyline> {
+    let do_infill = matches!(infill_step, Some(s) if s > 0.0) && sp.style.has_fill();
+    if !do_infill {
+        return sp.polylines;
     }
-    if !is_closed_polyline(&outline) {
-        // A filled-but-open subpath would be implicitly closed by an SVG renderer.
-        // We're stricter here and skip infill; the user likely wants to fix the path.
-        warn!("Filled path is not closed (first != last vertex); skipping infill");
-        return vec![outline];
+    let step = infill_step.expect("guarded by do_infill");
+
+    // Clean each subpath to a unique-vertex loop. Subpaths that don't form a
+    // closed loop with at least 3 points are passed through without infill.
+    let mut subpaths: Vec<Vec<CoordinatePair>> = Vec::with_capacity(sp.polylines.len());
+    let mut originals: Vec<Polyline> = Vec::with_capacity(sp.polylines.len());
+    for pl in sp.polylines {
+        let verts = unique_vertices(&pl);
+        originals.push(pl);
+        subpaths.push(verts);
     }
-    if !is_convex(&outline) {
-        warn!("Filled path is non-convex; skipping infill (only convex paths are supported)");
-        return vec![outline];
+
+    // Classify each subpath by containment depth. Depth-even subpaths are
+    // filled outers; depth-odd are holes of their nearest even-depth ancestor.
+    let depths = containment_depths(&subpaths);
+
+    // Group: each even-depth subpath starts a Shape unit and absorbs every
+    // depth-(d+1) subpath whose first vertex it directly contains.
+    #[derive(Default)]
+    struct ShapeUnit {
+        outer: usize,
+        holes: Vec<usize>,
     }
-    let rings = concentric_infill(&outline, step);
-    // Outline first, then rings going inward — keeps the engrave ordered
-    // outermost-to-innermost.
-    let mut out = Vec::with_capacity(rings.len() + 1);
-    out.push(outline);
-    out.extend(rings);
+    let mut units: Vec<ShapeUnit> = Vec::new();
+    for (i, &d) in depths.iter().enumerate() {
+        if d % 2 == 0 && subpaths[i].len() >= 3 {
+            units.push(ShapeUnit {
+                outer: i,
+                holes: Vec::new(),
+            });
+        }
+    }
+    for (i, &d) in depths.iter().enumerate() {
+        if d % 2 == 0 || subpaths[i].len() < 3 {
+            continue;
+        }
+        // Find the deepest even-depth parent (the immediately enclosing outer).
+        let test = subpaths[i][0];
+        let mut best: Option<(usize, usize)> = None; // (unit_idx, parent_depth)
+        for (u_idx, unit) in units.iter().enumerate() {
+            let parent_d = depths[unit.outer];
+            if parent_d + 1 != d {
+                continue;
+            }
+            if point_in_polygon(test, &subpaths[unit.outer]) {
+                if best.map_or(true, |(_, bd)| parent_d > bd) {
+                    best = Some((u_idx, parent_d));
+                }
+            }
+        }
+        if let Some((u_idx, _)) = best {
+            units[u_idx].holes.push(i);
+        }
+        // If no even-depth parent matches (shouldn't happen for well-formed
+        // SVG, but guard anyway), the subpath is dropped from infill but its
+        // outline is still emitted below.
+    }
+
+    let mut out: Vec<Polyline> = Vec::new();
+
+    // Emit outlines first, in source order, so the engraver does outline
+    // before rings.
+    for pl in &originals {
+        out.push(pl.clone());
+    }
+
+    // For each shape unit, generate concentric rings.
+    for unit in &units {
+        let rings = shape_concentric_infill(&subpaths[unit.outer], &unit.holes, &subpaths, step);
+        out.extend(rings);
+    }
+
     out
 }
 
-/// `true` iff the polyline's first vertex equals its last (within a tight
-/// tolerance). svg2polylines emits this shape when the source SVG path used
-/// `Z` to close.
-fn is_closed_polyline(polyline: &Polyline) -> bool {
-    let pts = polyline.as_ref();
-    if pts.len() < 3 {
-        return false;
-    }
-    let a = pts[0];
-    let b = pts[pts.len() - 1];
-    (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
-}
-
-/// `true` iff the closed polyline is convex (all turns have the same sign,
-/// ignoring straight-through / collinear vertices).
-fn is_convex(polyline: &Polyline) -> bool {
-    let pts = unique_vertices(polyline);
-    if pts.len() < 3 {
-        return false;
-    }
-    let n = pts.len();
-    let mut sign: f64 = 0.0;
-    for i in 0..n {
-        let a = pts[i];
-        let b = pts[(i + 1) % n];
-        let c = pts[(i + 2) % n];
-        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
-        if cross.abs() < 1e-9 {
-            continue;
-        }
-        if sign == 0.0 {
-            sign = cross;
-        } else if sign.signum() != cross.signum() {
-            return false;
-        }
-    }
-    sign != 0.0
+/// `true` iff a vertex equals its predecessor — used inside the cleanup loop
+/// in [`unique_vertices`].
+fn pts_eq(a: CoordinatePair, b: CoordinatePair) -> bool {
+    const EPS: f64 = 1e-9;
+    (a.x - b.x).abs() < EPS && (a.y - b.y).abs() < EPS
 }
 
 /// Open-loop vertex list with adjacent duplicates collapsed. Drops the
@@ -269,20 +295,18 @@ fn is_convex(polyline: &Polyline) -> bool {
 /// well as any other consecutive coincident vertices that can come out of
 /// curve flattening — cavalier_contours panics if it sees repeats.
 fn unique_vertices(polyline: &Polyline) -> Vec<CoordinatePair> {
-    const EPS: f64 = 1e-9;
     let pts = polyline.as_ref();
     let mut out: Vec<CoordinatePair> = Vec::with_capacity(pts.len());
     for &p in pts {
         match out.last() {
-            Some(last) if (last.x - p.x).abs() < EPS && (last.y - p.y).abs() < EPS => continue,
+            Some(&last) if pts_eq(last, p) => continue,
             _ => out.push(p),
         }
     }
-    // Drop the trailing-close vertex if it coincides with the first.
     if out.len() >= 2 {
         let first = out[0];
         let last = out[out.len() - 1];
-        if (first.x - last.x).abs() < EPS && (first.y - last.y).abs() < EPS {
+        if pts_eq(first, last) {
             out.pop();
         }
     }
@@ -304,47 +328,116 @@ fn signed_area(pts: &[CoordinatePair]) -> f64 {
     sum * 0.5
 }
 
-/// Generate concentric inward offsets of `outline` spaced by `step`. The
-/// outline itself is not included in the returned vector. Iteration stops when
-/// the offset operation produces no more loops (the shape has collapsed) or
-/// splits into multiple loops (shouldn't happen for a convex input, but we
-/// stop conservatively if it does).
-fn concentric_infill(outline: &Polyline, step: f64) -> Vec<Polyline> {
-    let verts = unique_vertices(outline);
-    if verts.len() < 3 {
+/// Standard ray-casting point-in-polygon test. The polygon is given as an
+/// open vertex loop (no repeated closing vertex). Boundary cases are not
+/// special-cased; that's fine for our use of testing whether one subpath's
+/// first vertex is inside another subpath, because subpaths from distinct
+/// SVG `M` segments don't share vertices.
+fn point_in_polygon(p: CoordinatePair, poly: &[CoordinatePair]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = poly[i];
+        let pj = poly[j];
+        if (pi.y > p.y) != (pj.y > p.y) {
+            let x_intersect = (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x;
+            if p.x < x_intersect {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// For each subpath, count how many other subpaths strictly contain it (via
+/// `point_in_polygon` on its first vertex). The result lets us classify
+/// each subpath as outer (even depth) or hole (odd depth).
+fn containment_depths(subpaths: &[Vec<CoordinatePair>]) -> Vec<usize> {
+    let n = subpaths.len();
+    let mut depths = vec![0usize; n];
+    for i in 0..n {
+        if subpaths[i].is_empty() {
+            continue;
+        }
+        let test = subpaths[i][0];
+        for j in 0..n {
+            if i == j || subpaths[j].len() < 3 {
+                continue;
+            }
+            if point_in_polygon(test, &subpaths[j]) {
+                depths[i] += 1;
+            }
+        }
+    }
+    depths
+}
+
+/// Build a cavalier `Shape` for a single filled region (one outer + its
+/// immediate holes), then iteratively offset inward by `step` until the
+/// shape collapses. The boundary loops in the input are not returned; only
+/// the resulting inset rings are.
+fn shape_concentric_infill(
+    outer: &[CoordinatePair],
+    hole_indices: &[usize],
+    all_subpaths: &[Vec<CoordinatePair>],
+    step: f64,
+) -> Vec<Polyline> {
+    if outer.len() < 3 || signed_area(outer).abs() < 1e-12 {
         return vec![];
     }
-    let area = signed_area(&verts);
-    if area.abs() < 1e-12 {
-        return vec![];
-    }
-    // cavalier_contours: positive offset = left of segment direction. For our
-    // input (math-CCW => area > 0), positive offset is inward. Match offset
-    // sign to area sign so we always shrink the enclosed region.
-    let offset_signed = step.copysign(area);
 
-    let mut current: CcPolyline<f64> = CcPolyline::new_closed();
-    for cp in &verts {
-        current.add(cp.x, cp.y, 0.0);
+    // Build a Shape with outer forced to CCW (positive math area) and each
+    // hole forced to CW (negative math area). Shape::from_plines classifies
+    // based on area sign, so getting orientations right is what tells
+    // cavalier which loop is filled and which is a hole.
+    let outer_pl = vertices_to_oriented_cc(outer, true);
+    let mut plines: Vec<CcPolyline<f64>> = vec![outer_pl];
+    for &idx in hole_indices {
+        let hole = &all_subpaths[idx];
+        if hole.len() < 3 {
+            continue;
+        }
+        plines.push(vertices_to_oriented_cc(hole, false));
     }
 
+    let mut current = Shape::from_plines(plines);
     let mut rings: Vec<Polyline> = Vec::new();
     loop {
-        let next = current.parallel_offset(offset_signed);
-        if next.is_empty() {
+        let next = current.parallel_offset(step, ShapeOffsetOptions::new());
+        if next.ccw_plines.is_empty() && next.cw_plines.is_empty() {
             break;
         }
-        for ring in &next {
-            rings.push(cc_polyline_to_polyline(ring));
+        for ipl in &next.ccw_plines {
+            rings.push(cc_polyline_to_polyline(&ipl.polyline));
         }
-        if next.len() != 1 {
-            // Convex input shouldn't split — bail out rather than recurse on
-            // each sub-loop. If we relax convexity later, recurse here.
-            break;
+        for ipl in &next.cw_plines {
+            rings.push(cc_polyline_to_polyline(&ipl.polyline));
         }
-        current = next.into_iter().next().unwrap();
+        current = next;
     }
     rings
+}
+
+/// Convert a vertex list to a closed cavalier polyline with the requested
+/// orientation (`make_ccw=true` => positive math area, otherwise negative).
+fn vertices_to_oriented_cc(verts: &[CoordinatePair], make_ccw: bool) -> CcPolyline<f64> {
+    let area = signed_area(verts);
+    let reverse = (area > 0.0) != make_ccw;
+    let iter: Box<dyn Iterator<Item = &CoordinatePair>> = if reverse {
+        Box::new(verts.iter().rev())
+    } else {
+        Box::new(verts.iter())
+    };
+    let mut pl = CcPolyline::new_closed();
+    for cp in iter {
+        pl.add(cp.x, cp.y, 0.0);
+    }
+    pl
 }
 
 /// Convert a closed cavalier polyline back to an svg2polylines `Polyline`,
