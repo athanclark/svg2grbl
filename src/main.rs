@@ -1149,14 +1149,15 @@ fn expand_path_with_infill(
             continue;
         }
         // Attach this hole to its immediate parent (depth d-1) outer.
-        let test = subpaths[i][0];
-        let mut best: Option<(usize, usize)> = None; // (unit_idx, parent_depth)
+        // Use the same multi-sample containment test as depth assignment
+        // so the two stay consistent on tricky cursive geometry.
+        let mut best: Option<(usize, usize)> = None;
         for (u_idx, unit) in units.iter().enumerate() {
             let parent_d = depths[unit.outer];
             if parent_d + 1 != d {
                 continue;
             }
-            if point_in_polygon(test, &subpaths[unit.outer])
+            if subpath_contained_in(&subpaths[i], &subpaths[unit.outer])
                 && best.map_or(true, |(_, bd)| parent_d > bd)
             {
                 best = Some((u_idx, parent_d));
@@ -1294,27 +1295,54 @@ fn point_in_polygon(p: CoordinatePair, poly: &[CoordinatePair]) -> bool {
     inside
 }
 
-/// For each subpath, count how many other subpaths strictly contain it (via
-/// `point_in_polygon` on its first vertex). The result lets us classify
-/// each subpath as outer (even depth) or hole (odd depth).
+/// For each subpath, count how many other subpaths strictly contain it.
+/// Even depth = outer; odd depth = hole.
 fn containment_depths(subpaths: &[Vec<CoordinatePair>]) -> Vec<usize> {
     let n = subpaths.len();
     let mut depths = vec![0usize; n];
     for i in 0..n {
-        if subpaths[i].is_empty() {
+        if subpaths[i].len() < 3 {
             continue;
         }
-        let test = subpaths[i][0];
         for j in 0..n {
             if i == j || subpaths[j].len() < 3 {
                 continue;
             }
-            if point_in_polygon(test, &subpaths[j]) {
+            if subpath_contained_in(&subpaths[i], &subpaths[j]) {
                 depths[i] += 1;
             }
         }
     }
     depths
+}
+
+/// `true` if subpath `a` is contained inside subpath `b`. Tests several
+/// edge midpoints of `a` and uses majority vote — robust to cases where a
+/// single vertex of `a` (notably the first one, which is often shared with
+/// another subpath in font glyphs) lands exactly on `b`'s boundary or in
+/// an ambiguous numerical position.
+fn subpath_contained_in(a: &[CoordinatePair], b: &[CoordinatePair]) -> bool {
+    let n = a.len();
+    if n < 2 || b.len() < 3 {
+        return false;
+    }
+    // Sample edge midpoints — they avoid the corner-case of a sample point
+    // coinciding with a vertex on `b`. Up to 9 samples spread evenly
+    // through `a`; majority decides.
+    let samples = n.min(9);
+    let mut inside = 0usize;
+    for k in 0..samples {
+        let i = (k * n) / samples;
+        let next_i = (i + 1) % n;
+        let mid = CoordinatePair::new(
+            (a[i].x + a[next_i].x) * 0.5,
+            (a[i].y + a[next_i].y) * 0.5,
+        );
+        if point_in_polygon(mid, b) {
+            inside += 1;
+        }
+    }
+    inside * 2 > samples
 }
 
 /// Build a cavalier `Shape` for a single filled region (one outer + its
