@@ -1,10 +1,17 @@
-use clap::{Parser, ArgAction};
-use std::{io::{self, Read}, fs::File, path::PathBuf};
-use svg2polylines::{Polyline, CoordinatePair};
+use cavalier_contours::polyline::{
+    PlineSource, PlineSourceMut, PlineVertex, Polyline as CcPolyline,
+};
+use clap::{ArgAction, Parser};
+use log::{info, warn};
 use roxmltree::Document;
 use std::str::FromStr;
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::PathBuf,
+};
+use svg2polylines::{CoordinatePair, Polyline, StyledPolyline};
 use svgtypes::{Length, LengthUnit, ViewBox};
-use log::{info};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -45,6 +52,11 @@ struct Args {
     #[arg(long, default_value_t = 16.0)]
     font_size: f64,
 
+    /// Spacing (in mm) between concentric infill passes for filled, convex paths.
+    /// If unset, no infill is generated.
+    #[arg(long)]
+    infill: Option<f64>,
+
     // TODO: Fill type? Gradients? etc
 }
 
@@ -78,11 +90,12 @@ fn main() -> io::Result<()> {
     info!("Extracting height");
     let height = svg_node.attribute("height").map(|h| length_to_mm(h, args.dpi, args.font_size)).transpose().map_err(io::Error::other).map(|h| h.unwrap_or(viewbox.h))?;
 
-    let polylines: Vec<Polyline> = svg2polylines::parse(
+    let styled: Vec<StyledPolyline> = svg2polylines::parse_styled(
         &svg_buf,
         args.tolerance,
-        args.preprocess
-    ).map_err(io::Error::other)?; // TODO customize how strokes, fill, etc are parsed
+        args.preprocess,
+    )
+    .map_err(io::Error::other)?;
 
     let mut gcodes: Vec<String> = vec![
         "G21".to_owned(), // use millimeters
@@ -92,16 +105,29 @@ fn main() -> io::Result<()> {
         "G28".to_owned(), // move to stored home
     ];
 
-    // this normalizes the units of the paths with respect to millimeters
-    let polylines: Vec<Polyline> = polylines
+    // Normalize coordinates of every polyline to millimeters via viewBox/width/height.
+    let styled: Vec<StyledPolyline> = styled
         .into_iter()
-        .map(|polyline| Polyline::from_vec(
-            polyline
-                .unwrap()
-                .into_iter()
-                .map(|p| CoordinatePair { x: (p.x / viewbox.w) * width, y: (p.y / viewbox.h) * height })
-                .collect()
-        ))
+        .map(|sp| StyledPolyline {
+            polyline: Polyline::from_vec(
+                sp.polyline
+                    .unwrap()
+                    .into_iter()
+                    .map(|p| CoordinatePair {
+                        x: (p.x / viewbox.w) * width,
+                        y: (p.y / viewbox.h) * height,
+                    })
+                    .collect(),
+            ),
+            style: sp.style,
+        })
+        .collect();
+
+    // For filled convex polylines, expand each into [outline, ring_1, ring_2, ...].
+    // Non-convex filled paths emit a warning and pass through unchanged.
+    let polylines: Vec<Polyline> = styled
+        .into_iter()
+        .flat_map(|sp| expand_with_infill(sp, args.infill))
         .collect();
 
     let points: Vec<CoordinatePair> = polylines
@@ -167,6 +193,163 @@ fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<V
     gcodes.push("M5".to_owned());
 
     Ok(gcodes)
+}
+
+/// Expand a styled polyline into its outline plus, if filled/convex/closed and
+/// `infill_step` is set, a sequence of inward concentric infill rings.
+fn expand_with_infill(sp: StyledPolyline, infill_step: Option<f64>) -> Vec<Polyline> {
+    let outline = sp.polyline;
+    let step = match infill_step {
+        Some(s) if s > 0.0 => s,
+        _ => return vec![outline],
+    };
+    if !sp.style.has_fill() {
+        return vec![outline];
+    }
+    if !is_closed_polyline(&outline) {
+        // A filled-but-open subpath would be implicitly closed by an SVG renderer.
+        // We're stricter here and skip infill; the user likely wants to fix the path.
+        warn!("Filled path is not closed (first != last vertex); skipping infill");
+        return vec![outline];
+    }
+    if !is_convex(&outline) {
+        warn!("Filled path is non-convex; skipping infill (only convex paths are supported)");
+        return vec![outline];
+    }
+    let rings = concentric_infill(&outline, step);
+    // Outline first, then rings going inward — keeps the engrave ordered
+    // outermost-to-innermost.
+    let mut out = Vec::with_capacity(rings.len() + 1);
+    out.push(outline);
+    out.extend(rings);
+    out
+}
+
+/// `true` iff the polyline's first vertex equals its last (within a tight
+/// tolerance). svg2polylines emits this shape when the source SVG path used
+/// `Z` to close.
+fn is_closed_polyline(polyline: &Polyline) -> bool {
+    let pts = polyline.as_ref();
+    if pts.len() < 3 {
+        return false;
+    }
+    let a = pts[0];
+    let b = pts[pts.len() - 1];
+    (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
+}
+
+/// `true` iff the closed polyline is convex (all turns have the same sign,
+/// ignoring straight-through / collinear vertices).
+fn is_convex(polyline: &Polyline) -> bool {
+    let pts = unique_vertices(polyline);
+    if pts.len() < 3 {
+        return false;
+    }
+    let n = pts.len();
+    let mut sign: f64 = 0.0;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let c = pts[(i + 2) % n];
+        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if cross.abs() < 1e-9 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross;
+        } else if sign.signum() != cross.signum() {
+            return false;
+        }
+    }
+    sign != 0.0
+}
+
+/// Strip a trailing duplicate of the first vertex if present (svg2polylines'
+/// way of marking a closed loop). Returns the open vertex list.
+fn unique_vertices(polyline: &Polyline) -> Vec<CoordinatePair> {
+    let pts = polyline.as_ref();
+    if pts.len() >= 2
+        && (pts[0].x - pts[pts.len() - 1].x).abs() < 1e-9
+        && (pts[0].y - pts[pts.len() - 1].y).abs() < 1e-9
+    {
+        pts[..pts.len() - 1].to_vec()
+    } else {
+        pts.clone()
+    }
+}
+
+/// Math-convention signed area (positive when vertices are CCW in y-up).
+fn signed_area(pts: &[CoordinatePair]) -> f64 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        sum += a.x * b.y - b.x * a.y;
+    }
+    sum * 0.5
+}
+
+/// Generate concentric inward offsets of `outline` spaced by `step`. The
+/// outline itself is not included in the returned vector. Iteration stops when
+/// the offset operation produces no more loops (the shape has collapsed) or
+/// splits into multiple loops (shouldn't happen for a convex input, but we
+/// stop conservatively if it does).
+fn concentric_infill(outline: &Polyline, step: f64) -> Vec<Polyline> {
+    let verts = unique_vertices(outline);
+    if verts.len() < 3 {
+        return vec![];
+    }
+    let area = signed_area(&verts);
+    if area.abs() < 1e-12 {
+        return vec![];
+    }
+    // cavalier_contours: positive offset = left of segment direction. For our
+    // input (math-CCW => area > 0), positive offset is inward. Match offset
+    // sign to area sign so we always shrink the enclosed region.
+    let offset_signed = step.copysign(area);
+
+    let mut current: CcPolyline<f64> = CcPolyline::new_closed();
+    for cp in &verts {
+        current.add(cp.x, cp.y, 0.0);
+    }
+
+    let mut rings: Vec<Polyline> = Vec::new();
+    loop {
+        let next = current.parallel_offset(offset_signed);
+        if next.is_empty() {
+            break;
+        }
+        for ring in &next {
+            rings.push(cc_polyline_to_polyline(ring));
+        }
+        if next.len() != 1 {
+            // Convex input shouldn't split — bail out rather than recurse on
+            // each sub-loop. If we relax convexity later, recurse here.
+            break;
+        }
+        current = next.into_iter().next().unwrap();
+    }
+    rings
+}
+
+/// Convert a closed cavalier polyline back to an svg2polylines `Polyline`,
+/// repeating the first vertex at the end so downstream g-code emission draws
+/// the closing segment.
+fn cc_polyline_to_polyline(pl: &CcPolyline<f64>) -> Polyline {
+    let n = pl.vertex_count();
+    let mut pts: Vec<CoordinatePair> = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        let v: PlineVertex<f64> = pl.at(i);
+        pts.push(CoordinatePair::new(v.x, v.y));
+    }
+    if let Some(first) = pts.first().copied() {
+        pts.push(first);
+    }
+    Polyline::from_vec(pts)
 }
 
 pub fn length_to_mm(s: &str, dpi: f64, font_px: f64) -> Result<f64, String> {
