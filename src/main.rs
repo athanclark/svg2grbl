@@ -1407,10 +1407,13 @@ fn shape_concentric_infill(
             warn!("Discarding degenerate offset iteration with out-of-bbox vertices");
             break;
         }
-        for ipl in &next.ccw_plines {
-            rings.push(cc_polyline_to_polyline(&ipl.polyline));
-        }
-        for ipl in &next.cw_plines {
+        for ipl in next.ccw_plines.iter().chain(next.cw_plines.iter()) {
+            // Skip degenerate "spike" polylines (e.g. 2 distinct vertices
+            // marked is_closed → A→B→A zero-area segment) that cavalier
+            // can emit at concave-corner offsets.
+            if ipl.polyline.vertex_count() < 3 {
+                continue;
+            }
             rings.push(cc_polyline_to_polyline(&ipl.polyline));
         }
         current = next;
