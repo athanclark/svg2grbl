@@ -3,7 +3,7 @@ use cavalier_contours::polyline::{
 };
 use cavalier_contours::shape_algorithms::{Shape, ShapeOffsetOptions};
 use clap::{ArgAction, Parser, ValueEnum};
-use log::info;
+use log::{info, warn};
 use roxmltree::Document;
 use std::str::FromStr;
 use std::{
@@ -37,7 +37,11 @@ struct Args {
     #[arg(short, long, default_value_t = 2.0)]
     max_line: f64,
 
-    /// Strength during engraving (`F` argument during engraving movement - max is found using `$$` in your machine's console, and looking at the `$30` value)
+    /// Maximum engraving strength — the `S` value used for a fully-black,
+    /// fully-opaque polyline. White maps to S0 (skipped), and other colors
+    /// are interpolated by Rec.709 grayscale luminance scaled by alpha.
+    /// Find your machine's true max with `$$` in the console (the `$30`
+    /// value).
     #[arg(long, default_value_t = 500.0)]
     strength: f64,
     
@@ -167,27 +171,24 @@ fn main() -> io::Result<()> {
         wave_period: args.infill_wave_period.unwrap_or(step * 4.0),
     });
 
-    // Expand each StyledPath into the polylines to engrave. For filled paths
-    // with --infill set, this includes the outline(s), any hole boundaries,
-    // and the chosen infill pattern of the polygon-with-holes.
-    let polylines: Vec<Polyline> = paths
+    // Expand each StyledPath into the polylines to engrave, each tagged
+    // with the laser power derived from its source color.
+    let polylines: Vec<PoweredPolyline> = paths
         .into_iter()
-        .flat_map(|sp| expand_path_with_infill(sp, infill_spec.as_ref()))
+        .flat_map(|sp| expand_path_with_infill(sp, infill_spec.as_ref(), args.strength))
         .collect();
 
     let points: Vec<CoordinatePair> = polylines
-        .clone()
-        .into_iter()
-        .map(|polyline| polyline.unwrap())
-        .flatten()
+        .iter()
+        .flat_map(|pp| pp.polyline.as_ref().iter().copied())
         .collect();
 
     let min_x = points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
     let max_y = points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
 
-    for polyline in polylines.into_iter() {
+    for pp in polylines.into_iter() {
         let polyline = Polyline::from_vec(
-            polyline
+            pp.polyline
                 .unwrap()
                 .into_iter()
                 .map(|p| if args.reset_origin {
@@ -197,7 +198,7 @@ fn main() -> io::Result<()> {
                 })
                 .collect()
         );
-        let mut gcodes_to_append = polyline2gcode(polyline, args.strength, args.speed)?;
+        let mut gcodes_to_append = polyline2gcode(polyline, pp.power, args.speed)?;
         gcodes.append(&mut gcodes_to_append);
     }
 
@@ -251,18 +252,79 @@ struct InfillSpec {
     wave_period: f64,
 }
 
-/// Expand a styled `<path>` into the polylines to engrave, observing the
-/// path's stroke and fill states:
+/// A polyline together with the laser-S value to engrave it at. Polylines
+/// whose computed power is non-positive are filtered out before this struct
+/// is built, so `power > 0.0` is an invariant for anything that reaches the
+/// G-code emitter.
+#[derive(Debug, Clone)]
+struct PoweredPolyline {
+    polyline: Polyline,
+    power: f64,
+}
+
+/// Convert a CSS color string into engraving power. SVG semantics:
+///   * a missing `fill` defaults to black; a missing `stroke` defaults to
+///     none. Callers handle that — here, `None` is interpreted as black so
+///     the function does the right thing for fill defaults.
+///   * `"none"` / `"transparent"` map to 0 power (the caller should already
+///     have stripped these via `has_fill`/`has_stroke`, so reaching this
+///     branch is defensive).
+///   * `"url(...)"` gradient/pattern references aren't yet supported —
+///     warn once per call and fall back to `max_power` so the path is at
+///     least visible in the output.
+///   * Anything csscolorparser can't parse warns and returns 0.
 ///
-/// - **Stroked path**: subpath outlines are always engraved.
+/// The mapping is `(1 - luminance) * alpha * max_power`, using Rec.709
+/// luminance weights. Black + opaque → `max_power`; white or fully
+/// transparent → 0.
+fn power_from_color(color: Option<&str>, max_power: f64) -> f64 {
+    let color = color.unwrap_or("black");
+    let trimmed = color.trim();
+    if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("transparent") {
+        return 0.0;
+    }
+    if trimmed.starts_with("url(") {
+        warn!(
+            "Gradient/pattern reference '{}' is not yet supported; treating as solid black",
+            trimmed
+        );
+        return max_power;
+    }
+    match csscolorparser::parse(trimmed) {
+        Ok(c) => {
+            let (r, g, b, a) = (c.r as f64, c.g as f64, c.b as f64, c.a as f64);
+            let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            (1.0 - luminance) * a * max_power
+        }
+        Err(e) => {
+            warn!("Could not parse color '{}': {}; skipping polyline", trimmed, e);
+            0.0
+        }
+    }
+}
+
+/// Expand a styled `<path>` into the polylines to engrave (each paired with
+/// the power level derived from its colour), observing the path's stroke
+/// and fill states:
+///
+/// - **Stroked path**: subpath outlines are always engraved at the stroke
+///   color's power.
 /// - **Filled-but-not-stroked path** with `--infill`:
-///   - `concentric`: outlines are still emitted, because the outer boundary
-///     *is* the outermost concentric ring (needed for 100% coverage).
-///   - `parallel`/`cross`/`wavy`: only the scan-line/wave segments are
-///     emitted; outlines are skipped so the engraving is "fill only".
+///   - `concentric`: outlines are emitted at the fill power (they *are*
+///     the outermost concentric ring).
+///   - `parallel`/`cross`/`wavy`: only the infill polylines are emitted,
+///     also at the fill power.
 /// - **Path with neither stroke nor fill** (or filled but `--infill` unset
 ///   and not stroked): contributes nothing.
-fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<Polyline> {
+///
+/// Polylines whose computed power is non-positive are filtered out, so a
+/// white-on-black SVG (where `white → 0`) naturally produces an empty pass
+/// instead of `S0` engraves.
+fn expand_path_with_infill(
+    sp: StyledPath,
+    infill: Option<&InfillSpec>,
+    max_power: f64,
+) -> Vec<PoweredPolyline> {
     let has_stroke = sp.style.has_stroke();
     let has_fill = sp.style.has_fill();
     let spec = match infill {
@@ -282,11 +344,28 @@ fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<P
     let emit_outlines = has_stroke
         || matches!(spec.map(|s| s.pattern), Some(InfillPattern::Concentric));
 
+    // Power for outline polylines: stroke color if stroked, else fill color
+    // (we only reach the unstroked-outline branch for concentric infill, and
+    // there the outline serves as the outermost fill ring).
+    let outline_power = if has_stroke {
+        power_from_color(sp.style.stroke.as_deref(), max_power)
+    } else {
+        power_from_color(sp.style.fill.as_deref(), max_power)
+    };
+    let infill_power = power_from_color(sp.style.fill.as_deref(), max_power);
+
+    let attach = |power: f64| {
+        move |polyline: Polyline| PoweredPolyline { polyline, power }
+    };
+
     let spec = match spec {
         Some(s) => s,
         None => {
-            // Stroked-only branch: just pass the subpath outlines through.
-            return if emit_outlines { sp.polylines } else { vec![] };
+            // Stroked-only branch.
+            if !emit_outlines || outline_power <= 0.0 {
+                return vec![];
+            }
+            return sp.polylines.into_iter().map(attach(outline_power)).collect();
         }
     };
 
@@ -340,17 +419,19 @@ fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<P
         }
     }
 
-    let mut out: Vec<Polyline> = Vec::new();
+    let mut out: Vec<PoweredPolyline> = Vec::new();
 
-    // Outlines first, in source order, so the engraver does outline then
-    // infill — but only when stroke is present, or when the pattern is
-    // concentric (in which case the outline doubles as the outermost ring).
-    if emit_outlines {
-        for pl in &originals {
-            out.push(pl.clone());
-        }
+    // Outlines first (when we should emit them and their power isn't zero).
+    if emit_outlines && outline_power > 0.0 {
+        out.extend(originals.iter().cloned().map(attach(outline_power)));
     }
 
+    // Infill polylines come after, all tagged with the fill color's power.
+    // If that power is zero (transparent or white fill), skip generation
+    // entirely — there's nothing to engrave.
+    if infill_power <= 0.0 {
+        return out;
+    }
     for unit in &units {
         let outer_pts: &[CoordinatePair] = &subpaths[unit.outer];
         let hole_pts: Vec<&[CoordinatePair]> = unit
@@ -382,7 +463,7 @@ fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<P
                 spec.wave_period,
             ),
         };
-        out.extend(rings);
+        out.extend(rings.into_iter().map(attach(infill_power)));
     }
 
     out
