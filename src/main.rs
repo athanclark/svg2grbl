@@ -2,7 +2,7 @@ use cavalier_contours::polyline::{
     PlineSource, PlineSourceMut, PlineVertex, Polyline as CcPolyline,
 };
 use cavalier_contours::shape_algorithms::{Shape, ShapeOffsetOptions};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use log::info;
 use roxmltree::Document;
 use std::str::FromStr;
@@ -53,14 +53,46 @@ struct Args {
     #[arg(long, default_value_t = 16.0)]
     font_size: f64,
 
-    /// Spacing (in mm) between concentric infill passes for filled paths.
-    /// Holes are detected via subpath containment (so glyphs with holes work
-    /// correctly), and the offset is robust on non-convex outlines. If unset,
-    /// no infill is generated.
+    /// Spacing (in mm) between infill passes for filled paths. Holes are
+    /// detected via subpath containment (so glyphs with holes work
+    /// correctly), and concentric offsets are robust on non-convex outlines.
+    /// If unset, no infill is generated.
     #[arg(long)]
     infill: Option<f64>,
 
+    /// Infill pattern to use when `--infill` is set.
+    #[arg(long, value_enum, default_value_t = InfillPattern::Concentric)]
+    infill_pattern: InfillPattern,
+
+    /// Angle (degrees, CCW from +X) for parallel / cross / wavy infill.
+    /// Ignored for concentric. Cross-hatch lays a second pass at this
+    /// angle + 90°.
+    #[arg(long, default_value_t = 0.0)]
+    infill_angle: f64,
+
+    /// Wave amplitude (mm) for the wavy pattern. Defaults to the infill
+    /// step. Ignored for other patterns.
+    #[arg(long)]
+    infill_wave_amplitude: Option<f64>,
+
+    /// Wave period (mm) for the wavy pattern. Defaults to 4× the infill
+    /// step. Ignored for other patterns.
+    #[arg(long)]
+    infill_wave_period: Option<f64>,
+
     // TODO: Fill type? Gradients? etc
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum InfillPattern {
+    /// Concentric rings stepping inward from the boundary.
+    Concentric,
+    /// Parallel straight lines at `--infill-angle`.
+    Parallel,
+    /// Two perpendicular sets of parallel lines.
+    Cross,
+    /// Parallel lines that wobble along a sine wave.
+    Wavy,
 }
 
 fn main() -> io::Result<()> {
@@ -125,12 +157,22 @@ fn main() -> io::Result<()> {
         })
         .collect();
 
+    // Bundle the infill knobs into a single spec, applying defaults for the
+    // wavy pattern's amplitude/period that depend on the step itself.
+    let infill_spec: Option<InfillSpec> = args.infill.filter(|s| *s > 0.0).map(|step| InfillSpec {
+        step,
+        pattern: args.infill_pattern,
+        angle_deg: args.infill_angle,
+        wave_amplitude: args.infill_wave_amplitude.unwrap_or(step),
+        wave_period: args.infill_wave_period.unwrap_or(step * 4.0),
+    });
+
     // Expand each StyledPath into the polylines to engrave. For filled paths
     // with --infill set, this includes the outline(s), any hole boundaries,
-    // and the concentric infill rings of the polygon-with-holes.
+    // and the chosen infill pattern of the polygon-with-holes.
     let polylines: Vec<Polyline> = paths
         .into_iter()
-        .flat_map(|sp| expand_path_with_infill(sp, args.infill))
+        .flat_map(|sp| expand_path_with_infill(sp, infill_spec.as_ref()))
         .collect();
 
     let points: Vec<CoordinatePair> = polylines
@@ -198,17 +240,28 @@ fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<V
     Ok(gcodes)
 }
 
+/// All the knobs the infill stage needs, bundled so we can pass one
+/// `Option<&InfillSpec>` around instead of half a dozen parameters.
+#[derive(Debug, Clone)]
+struct InfillSpec {
+    step: f64,
+    pattern: InfillPattern,
+    angle_deg: f64,
+    wave_amplitude: f64,
+    wave_period: f64,
+}
+
 /// Expand a styled `<path>` into the polylines to engrave. For filled paths
-/// with `infill_step` set, this includes the outline of every subpath plus
-/// concentric infill rings of the polygon-with-holes (holes are detected by
-/// containment within the same `<path>`). For unfilled paths, or when no
-/// step is given, the subpath outlines pass through unchanged.
-fn expand_path_with_infill(sp: StyledPath, infill_step: Option<f64>) -> Vec<Polyline> {
-    let do_infill = matches!(infill_step, Some(s) if s > 0.0) && sp.style.has_fill();
-    if !do_infill {
-        return sp.polylines;
-    }
-    let step = infill_step.expect("guarded by do_infill");
+/// with `infill` set, this includes the outline of every subpath plus the
+/// chosen infill pattern's polylines for the polygon-with-holes (holes are
+/// detected by containment within the same `<path>`). For unfilled paths,
+/// or when no infill is requested, the subpath outlines pass through
+/// unchanged.
+fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<Polyline> {
+    let spec = match infill {
+        Some(s) if sp.style.has_fill() => s,
+        _ => return sp.polylines,
+    };
 
     // Clean each subpath to a unique-vertex loop. Subpaths that don't form a
     // closed loop with at least 3 points are passed through without infill.
@@ -224,9 +277,6 @@ fn expand_path_with_infill(sp: StyledPath, infill_step: Option<f64>) -> Vec<Poly
     // filled outers; depth-odd are holes of their nearest even-depth ancestor.
     let depths = containment_depths(&subpaths);
 
-    // Group: each even-depth subpath starts a Shape unit and absorbs every
-    // depth-(d+1) subpath whose first vertex it directly contains.
-    #[derive(Default)]
     struct ShapeUnit {
         outer: usize,
         holes: Vec<usize>,
@@ -244,7 +294,7 @@ fn expand_path_with_infill(sp: StyledPath, infill_step: Option<f64>) -> Vec<Poly
         if d % 2 == 0 || subpaths[i].len() < 3 {
             continue;
         }
-        // Find the deepest even-depth parent (the immediately enclosing outer).
+        // Attach this hole to its immediate parent (depth d-1) outer.
         let test = subpaths[i][0];
         let mut best: Option<(usize, usize)> = None; // (unit_idx, parent_depth)
         for (u_idx, unit) in units.iter().enumerate() {
@@ -252,31 +302,55 @@ fn expand_path_with_infill(sp: StyledPath, infill_step: Option<f64>) -> Vec<Poly
             if parent_d + 1 != d {
                 continue;
             }
-            if point_in_polygon(test, &subpaths[unit.outer]) {
-                if best.map_or(true, |(_, bd)| parent_d > bd) {
-                    best = Some((u_idx, parent_d));
-                }
+            if point_in_polygon(test, &subpaths[unit.outer])
+                && best.map_or(true, |(_, bd)| parent_d > bd)
+            {
+                best = Some((u_idx, parent_d));
             }
         }
         if let Some((u_idx, _)) = best {
             units[u_idx].holes.push(i);
         }
-        // If no even-depth parent matches (shouldn't happen for well-formed
-        // SVG, but guard anyway), the subpath is dropped from infill but its
-        // outline is still emitted below.
     }
 
     let mut out: Vec<Polyline> = Vec::new();
 
-    // Emit outlines first, in source order, so the engraver does outline
-    // before rings.
+    // Outlines first, in source order, so the engraver does outline then infill.
     for pl in &originals {
         out.push(pl.clone());
     }
 
-    // For each shape unit, generate concentric rings.
     for unit in &units {
-        let rings = shape_concentric_infill(&subpaths[unit.outer], &unit.holes, &subpaths, step);
+        let outer_pts: &[CoordinatePair] = &subpaths[unit.outer];
+        let hole_pts: Vec<&[CoordinatePair]> = unit
+            .holes
+            .iter()
+            .map(|&i| subpaths[i].as_slice())
+            .filter(|s| s.len() >= 3)
+            .collect();
+        let rings = match spec.pattern {
+            InfillPattern::Concentric => shape_concentric_infill(outer_pts, &hole_pts, spec.step),
+            InfillPattern::Parallel => parallel_infill(outer_pts, &hole_pts, spec.step, spec.angle_deg),
+            InfillPattern::Cross => {
+                let mut lines =
+                    parallel_infill(outer_pts, &hole_pts, spec.step, spec.angle_deg);
+                lines.extend(parallel_infill(
+                    outer_pts,
+                    &hole_pts,
+                    spec.step,
+                    spec.angle_deg + 90.0,
+                ));
+                lines
+            }
+            InfillPattern::Wavy => wavy_infill(
+                outer_pts,
+                &hole_pts,
+                spec.step,
+                spec.angle_deg,
+                spec.wave_amplitude,
+                spec.wave_period,
+            ),
+        };
         out.extend(rings);
     }
 
@@ -383,8 +457,7 @@ fn containment_depths(subpaths: &[Vec<CoordinatePair>]) -> Vec<usize> {
 /// the resulting inset rings are.
 fn shape_concentric_infill(
     outer: &[CoordinatePair],
-    hole_indices: &[usize],
-    all_subpaths: &[Vec<CoordinatePair>],
+    holes: &[&[CoordinatePair]],
     step: f64,
 ) -> Vec<Polyline> {
     if outer.len() < 3 || signed_area(outer).abs() < 1e-12 {
@@ -397,8 +470,7 @@ fn shape_concentric_infill(
     // cavalier which loop is filled and which is a hole.
     let outer_pl = vertices_to_oriented_cc(outer, true);
     let mut plines: Vec<CcPolyline<f64>> = vec![outer_pl];
-    for &idx in hole_indices {
-        let hole = &all_subpaths[idx];
+    for &hole in holes {
         if hole.len() < 3 {
             continue;
         }
@@ -421,6 +493,193 @@ fn shape_concentric_infill(
         current = next;
     }
     rings
+}
+
+/// Straight-line scan-line infill of the polygon-with-holes. Each scan line
+/// produces zero or more 2-point polylines, one per "in-out" segment pair
+/// from the scan's intersections with edges of the outer and the holes.
+/// Lines alternate direction (boustrophedon) to minimise pen-up travel.
+fn parallel_infill(
+    outer: &[CoordinatePair],
+    holes: &[&[CoordinatePair]],
+    step: f64,
+    angle_deg: f64,
+) -> Vec<Polyline> {
+    let theta = angle_deg.to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+
+    // Rotate by -theta so the scan direction becomes the +X axis (and so
+    // "horizontal scan lines" become lines of constant y in the rotated
+    // frame). Inverse rotation is +theta.
+    let rot = |p: CoordinatePair| CoordinatePair::new(c * p.x + s * p.y, -s * p.x + c * p.y);
+    let unrot =
+        |p: CoordinatePair| CoordinatePair::new(c * p.x - s * p.y, s * p.x + c * p.y);
+
+    let outer_rot: Vec<CoordinatePair> = outer.iter().copied().map(rot).collect();
+    let holes_rot: Vec<Vec<CoordinatePair>> = holes
+        .iter()
+        .map(|h| h.iter().copied().map(rot).collect())
+        .collect();
+
+    let (ymin, ymax) = match y_bounds(&outer_rot) {
+        Some(b) => b,
+        None => return vec![],
+    };
+
+    let mut polylines = Vec::new();
+    // Offset the first line a half-step in from the edge so we don't try to
+    // scan exactly along a vertex or edge.
+    let mut y = ymin + step * 0.5;
+    let mut flip = false;
+    while y < ymax {
+        let mut xs: Vec<f64> = Vec::new();
+        push_scan_intersections(&outer_rot, y, &mut xs);
+        for h in &holes_rot {
+            push_scan_intersections(h, y, &mut xs);
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for chunk in xs.chunks_exact(2) {
+            let (x0, x1) = (chunk[0], chunk[1]);
+            let (a, b) = if flip { (x1, x0) } else { (x0, x1) };
+            polylines.push(Polyline::from_vec(vec![
+                unrot(CoordinatePair::new(a, y)),
+                unrot(CoordinatePair::new(b, y)),
+            ]));
+        }
+        flip = !flip;
+        y += step;
+    }
+    polylines
+}
+
+/// Like [`parallel_infill`], but each filled segment is sampled along a
+/// sine wave: `y_sample = scan_y + amplitude * sin(2π * x / period)`. The
+/// wave's centerline is the scan line, so the segment endpoints sit exactly
+/// on the polygon boundary in the rotated frame.
+fn wavy_infill(
+    outer: &[CoordinatePair],
+    holes: &[&[CoordinatePair]],
+    step: f64,
+    angle_deg: f64,
+    amplitude: f64,
+    period: f64,
+) -> Vec<Polyline> {
+    let theta = angle_deg.to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+    let rot = |p: CoordinatePair| CoordinatePair::new(c * p.x + s * p.y, -s * p.x + c * p.y);
+    let unrot =
+        |p: CoordinatePair| CoordinatePair::new(c * p.x - s * p.y, s * p.x + c * p.y);
+
+    let outer_rot: Vec<CoordinatePair> = outer.iter().copied().map(rot).collect();
+    let holes_rot: Vec<Vec<CoordinatePair>> = holes
+        .iter()
+        .map(|h| h.iter().copied().map(rot).collect())
+        .collect();
+
+    let (ymin, ymax) = match y_bounds(&outer_rot) {
+        Some(b) => b,
+        None => return vec![],
+    };
+
+    // Sample density: small enough to keep the sine looking smooth.
+    let sample_step = (period / 16.0).max(1e-3);
+
+    let mut polylines = Vec::new();
+    let mut y = ymin + step * 0.5;
+    let mut flip = false;
+    while y < ymax {
+        let mut xs: Vec<f64> = Vec::new();
+        push_scan_intersections(&outer_rot, y, &mut xs);
+        for h in &holes_rot {
+            push_scan_intersections(h, y, &mut xs);
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for chunk in xs.chunks_exact(2) {
+            let (x0, x1) = (chunk[0], chunk[1]);
+            let pts = sine_samples(x0, x1, y, amplitude, period, sample_step, flip);
+            polylines.push(Polyline::from_vec(pts.into_iter().map(unrot).collect()));
+        }
+        flip = !flip;
+        y += step;
+    }
+    polylines
+}
+
+/// Generate the sampled points of a single sine-wave segment from `x0` to
+/// `x1` (or reversed if `flip`) along scan line `y`, with the given
+/// amplitude / period. Endpoints are forced to (x*, y) so the wave starts
+/// and ends exactly on the polygon boundary.
+fn sine_samples(
+    x_start: f64,
+    x_end: f64,
+    y: f64,
+    amplitude: f64,
+    period: f64,
+    sample_step: f64,
+    flip: bool,
+) -> Vec<CoordinatePair> {
+    let (a, b) = if flip {
+        (x_end, x_start)
+    } else {
+        (x_start, x_end)
+    };
+    let direction = (b - a).signum();
+    let length = (b - a).abs();
+    let n = (length / sample_step).floor() as usize;
+    let mut pts = Vec::with_capacity(n + 2);
+    pts.push(CoordinatePair::new(a, y));
+    let omega = std::f64::consts::TAU / period;
+    for k in 1..=n {
+        let x = a + direction * (k as f64) * sample_step;
+        // If the last sample lands within an epsilon of the segment's end,
+        // skip it — the forced endpoint below covers it without producing a
+        // duplicate vertex.
+        if k == n && (x - b).abs() < 1e-9 {
+            break;
+        }
+        let dy = amplitude * (omega * x).sin();
+        pts.push(CoordinatePair::new(x, y + dy));
+    }
+    pts.push(CoordinatePair::new(b, y));
+    pts
+}
+
+/// y-range of a polygon's vertices in the rotated frame. Returns None for
+/// degenerate (empty or vanishingly thin) input.
+fn y_bounds(verts: &[CoordinatePair]) -> Option<(f64, f64)> {
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for p in verts {
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+    if !ymin.is_finite() || !ymax.is_finite() || ymax - ymin <= 0.0 {
+        None
+    } else {
+        Some((ymin, ymax))
+    }
+}
+
+/// Push the x-coordinates of every intersection of the horizontal line
+/// `y = scan_y` with the edges of `polygon` into `xs`. The convention
+/// `(pi.y > y) != (pj.y > y)` excludes purely horizontal edges and treats
+/// a vertex shared between two upward-or-two-downward edges as one
+/// crossing, both of which are necessary for correct in/out pairing.
+fn push_scan_intersections(polygon: &[CoordinatePair], scan_y: f64, xs: &mut Vec<f64>) {
+    let n = polygon.len();
+    if n < 3 {
+        return;
+    }
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = polygon[i];
+        let pj = polygon[j];
+        if (pi.y > scan_y) != (pj.y > scan_y) {
+            let x = (pj.x - pi.x) * (scan_y - pi.y) / (pj.y - pi.y) + pi.x;
+            xs.push(x);
+        }
+        j = i;
+    }
 }
 
 /// Convert a vertex list to a closed cavalier polyline with the requested
