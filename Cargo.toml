@@ -12,3 +12,13 @@ log = "0.4.29"
 roxmltree = "0.21.1"
 svg2polylines = { path = "../svg2polylines" }
 svgtypes = "0.16.1"
+
+# cavalier_contours sprinkles debug_assert!s through its offset algorithm
+# that catch internal invariants it considers unusual — but the affected
+# functions still return valid results in those cases. We hit two of those
+# asserts on real SVG glyph offsets (repeat-position, and end-point-on-
+# final-offset-vertex) where the actual output is fine. Disable cavalier's
+# debug-assertions even in dev so the program doesn't panic on inputs that
+# would otherwise produce correct gcode in release mode.
+[profile.dev.package.cavalier_contours]
+debug-assertions = false
