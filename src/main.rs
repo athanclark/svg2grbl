@@ -5,6 +5,7 @@ use cavalier_contours::shape_algorithms::{Shape, ShapeOffsetOptions};
 use clap::{ArgAction, Parser, ValueEnum};
 use log::{info, warn};
 use roxmltree::Document;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::{
     fs::File,
@@ -171,11 +172,20 @@ fn main() -> io::Result<()> {
         wave_period: args.infill_wave_period.unwrap_or(step * 4.0),
     });
 
+    // Parse all gradient elements in the document so url(#id) references on
+    // fills/strokes can be resolved. Done after we've parsed viewBox so we
+    // can normalise userSpaceOnUse coords into the same mm space as the
+    // polylines.
+    let gradients = parse_gradients(&doc, &viewbox, width, height);
+
     // Expand each StyledPath into the polylines to engrave, each tagged
-    // with the laser power derived from its source color.
+    // with the laser power derived from its source color (or gradient
+    // sampled at the polyline's centroid).
     let polylines: Vec<PoweredPolyline> = paths
         .into_iter()
-        .flat_map(|sp| expand_path_with_infill(sp, infill_spec.as_ref(), args.strength))
+        .flat_map(|sp| {
+            expand_path_with_infill(sp, infill_spec.as_ref(), args.strength, &gradients)
+        })
         .collect();
 
     let points: Vec<CoordinatePair> = polylines
@@ -262,6 +272,241 @@ struct PoweredPolyline {
     power: f64,
 }
 
+/// Where a gradient's geometric attributes (`x1`, `cx`, etc.) live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradientUnits {
+    /// Default per the SVG spec: coordinates are 0..1 within the path's bbox.
+    ObjectBoundingBox,
+    /// Coordinates are in user space (mm here, since we normalise both
+    /// gradient and polyline coordinates the same way).
+    UserSpaceOnUse,
+}
+
+/// What happens for sample offsets outside `[0, 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpreadMethod {
+    /// Clamp to `[0, 1]`.
+    Pad,
+    /// Mirror across each integer boundary.
+    Reflect,
+    /// Wrap (modulo 1).
+    Repeat,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GradientStop {
+    offset: f64,
+    /// Pre-resolved RGBA in `[0, 1]`. Stored unpacked rather than as a
+    /// `csscolorparser::Color` so the struct is `Copy`.
+    rgba: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GradientShape {
+    Linear { x1: f64, y1: f64, x2: f64, y2: f64 },
+    Radial {
+        cx: f64,
+        cy: f64,
+        fx: f64,
+        fy: f64,
+        r: f64,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct Gradient {
+    shape: GradientShape,
+    stops: Vec<GradientStop>,
+    units: GradientUnits,
+    spread: SpreadMethod,
+}
+
+type GradientRegistry = HashMap<String, Gradient>;
+
+/// Everything `power_from_color` needs to resolve a CSS color — including
+/// gradient lookups, the path's bounding box for `objectBoundingBox` units,
+/// and the sample point on the polyline (its centroid in mm).
+struct ColorEnv<'a> {
+    gradients: &'a GradientRegistry,
+    bbox: Bbox,
+    sample: CoordinatePair,
+}
+
+/// Axis-aligned bounding box. `(min_x, min_y, max_x, max_y)`.
+#[derive(Debug, Clone, Copy)]
+struct Bbox {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl Bbox {
+    fn width(&self) -> f64 {
+        self.max_x - self.min_x
+    }
+    fn height(&self) -> f64 {
+        self.max_y - self.min_y
+    }
+}
+
+/// Compute the axis-aligned bbox of all vertices across the given polylines.
+/// Returns None if there are no vertices.
+fn polylines_bbox(polylines: &[Polyline]) -> Option<Bbox> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for pl in polylines {
+        for p in pl.as_ref() {
+            if p.x < min_x {
+                min_x = p.x;
+            }
+            if p.x > max_x {
+                max_x = p.x;
+            }
+            if p.y < min_y {
+                min_y = p.y;
+            }
+            if p.y > max_y {
+                max_y = p.y;
+            }
+        }
+    }
+    if !min_x.is_finite() {
+        None
+    } else {
+        Some(Bbox {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        })
+    }
+}
+
+/// Arithmetic mean of a polyline's vertices. Sufficient as the "center of
+/// the polyline" sample point for both short two-point scan-line segments
+/// (where it equals the midpoint) and longer concentric rings. If the
+/// polyline is closed (its last vertex repeats the first), the closure
+/// vertex is excluded so it doesn't bias the mean toward the start vertex.
+fn polyline_centroid(pl: &Polyline) -> CoordinatePair {
+    let pts = pl.as_ref();
+    if pts.is_empty() {
+        return CoordinatePair::new(0.0, 0.0);
+    }
+    let n_full = pts.len();
+    let count = if n_full >= 2
+        && (pts[0].x - pts[n_full - 1].x).abs() < 1e-9
+        && (pts[0].y - pts[n_full - 1].y).abs() < 1e-9
+    {
+        n_full - 1
+    } else {
+        n_full
+    };
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    for p in &pts[..count] {
+        sx += p.x;
+        sy += p.y;
+    }
+    let n = count as f64;
+    CoordinatePair::new(sx / n, sy / n)
+}
+
+/// Apply a spread method to a raw gradient offset `t`, returning a value
+/// in `[0, 1]`.
+fn apply_spread(t: f64, spread: SpreadMethod) -> f64 {
+    match spread {
+        SpreadMethod::Pad => t.clamp(0.0, 1.0),
+        SpreadMethod::Repeat => t.rem_euclid(1.0),
+        SpreadMethod::Reflect => {
+            let two = t.rem_euclid(2.0);
+            if two <= 1.0 { two } else { 2.0 - two }
+        }
+    }
+}
+
+/// Linearly interpolate between sorted-by-offset stops at parameter `t`
+/// (already in `[0, 1]`). Stops are assumed non-empty; the caller handles
+/// degenerate cases.
+fn interpolate_stops(stops: &[GradientStop], t: f64) -> [f32; 4] {
+    if t <= stops.first().expect("non-empty").offset {
+        return stops.first().unwrap().rgba;
+    }
+    if t >= stops.last().unwrap().offset {
+        return stops.last().unwrap().rgba;
+    }
+    let pos = stops.windows(2).find(|w| t >= w[0].offset && t <= w[1].offset);
+    let (a, b) = match pos {
+        Some(w) => (w[0], w[1]),
+        None => return stops.last().unwrap().rgba,
+    };
+    let span = b.offset - a.offset;
+    let u = if span > 0.0 { (t - a.offset) / span } else { 0.0 };
+    let lerp = |x: f32, y: f32| (x as f64 + (y - x) as f64 * u) as f32;
+    [
+        lerp(a.rgba[0], b.rgba[0]),
+        lerp(a.rgba[1], b.rgba[1]),
+        lerp(a.rgba[2], b.rgba[2]),
+        lerp(a.rgba[3], b.rgba[3]),
+    ]
+}
+
+/// Sample a gradient at the given environment's `sample` point. The point
+/// and the gradient must live in the same coordinate system — for
+/// `objectBoundingBox` we normalise the sample point to `[0, 1]` within the
+/// path bbox first.
+fn sample_gradient(g: &Gradient, env: &ColorEnv) -> Option<[f32; 4]> {
+    if g.stops.is_empty() {
+        return None;
+    }
+    // Express the sample in the same units the gradient's geometric attrs
+    // are in.
+    let (sx, sy) = match g.units {
+        GradientUnits::UserSpaceOnUse => (env.sample.x, env.sample.y),
+        GradientUnits::ObjectBoundingBox => {
+            let w = env.bbox.width();
+            let h = env.bbox.height();
+            if w <= 0.0 || h <= 0.0 {
+                return Some(g.stops[0].rgba);
+            }
+            (
+                (env.sample.x - env.bbox.min_x) / w,
+                (env.sample.y - env.bbox.min_y) / h,
+            )
+        }
+    };
+
+    let t = match g.shape {
+        GradientShape::Linear { x1, y1, x2, y2 } => {
+            let dx = x2 - x1;
+            let dy = y2 - y1;
+            let len_sq = dx * dx + dy * dy;
+            if len_sq <= 0.0 {
+                0.0
+            } else {
+                ((sx - x1) * dx + (sy - y1) * dy) / len_sq
+            }
+        }
+        GradientShape::Radial { cx, cy, fx, fy, r } => {
+            if r <= 0.0 {
+                0.0
+            } else {
+                let ddx = sx - cx;
+                let ddy = sy - cy;
+                // Common case: focal point at center. Anything else gets
+                // approximated by the radial-from-center distance, with a
+                // warning at parse time.
+                let _ = (fx, fy);
+                (ddx * ddx + ddy * ddy).sqrt() / r
+            }
+        }
+    };
+    let t = apply_spread(t, g.spread);
+    Some(interpolate_stops(&g.stops, t))
+}
+
 /// Convert a CSS color string into engraving power. SVG semantics:
 ///   * a missing `fill` defaults to black; a missing `stroke` defaults to
 ///     none. Callers handle that — here, `None` is interpreted as black so
@@ -269,38 +514,321 @@ struct PoweredPolyline {
 ///   * `"none"` / `"transparent"` map to 0 power (the caller should already
 ///     have stripped these via `has_fill`/`has_stroke`, so reaching this
 ///     branch is defensive).
-///   * `"url(...)"` gradient/pattern references aren't yet supported —
-///     warn once per call and fall back to `max_power` so the path is at
-///     least visible in the output.
+///   * `"url(#id)"` resolves the referenced gradient at the env's sample
+///     point. Unknown ids and non-gradient `url(...)` references warn and
+///     fall back to solid black.
 ///   * Anything csscolorparser can't parse warns and returns 0.
 ///
 /// The mapping is `(1 - luminance) * alpha * max_power`, using Rec.709
 /// luminance weights. Black + opaque → `max_power`; white or fully
 /// transparent → 0.
-fn power_from_color(color: Option<&str>, max_power: f64) -> f64 {
+fn power_from_color(color: Option<&str>, max_power: f64, env: &ColorEnv) -> f64 {
     let color = color.unwrap_or("black");
     let trimmed = color.trim();
     if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("transparent") {
         return 0.0;
     }
-    if trimmed.starts_with("url(") {
-        warn!(
-            "Gradient/pattern reference '{}' is not yet supported; treating as solid black",
-            trimmed
-        );
-        return max_power;
+    if let Some(id) = parse_url_ref(trimmed) {
+        match env.gradients.get(id) {
+            Some(grad) => match sample_gradient(grad, env) {
+                Some(rgba) => return rgba_to_power(rgba, max_power),
+                None => {
+                    warn!("Gradient '#{}' has no stops; treating as black", id);
+                    return max_power;
+                }
+            },
+            None => {
+                warn!(
+                    "Unknown url() reference '{}' (likely a pattern or non-gradient paint); treating as black",
+                    trimmed
+                );
+                return max_power;
+            }
+        }
     }
     match csscolorparser::parse(trimmed) {
-        Ok(c) => {
-            let (r, g, b, a) = (c.r as f64, c.g as f64, c.b as f64, c.a as f64);
-            let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            (1.0 - luminance) * a * max_power
-        }
+        Ok(c) => rgba_to_power([c.r, c.g, c.b, c.a], max_power),
         Err(e) => {
             warn!("Could not parse color '{}': {}; skipping polyline", trimmed, e);
             0.0
         }
     }
+}
+
+/// Rec.709 luminance → engraving power for a pre-unpacked RGBA tuple.
+fn rgba_to_power(rgba: [f32; 4], max_power: f64) -> f64 {
+    let (r, g, b, a) = (
+        rgba[0] as f64,
+        rgba[1] as f64,
+        rgba[2] as f64,
+        rgba[3] as f64,
+    );
+    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    (1.0 - luminance) * a * max_power
+}
+
+/// Extract the `id` from a CSS-style `url(#id)` reference. Returns `None`
+/// if the input doesn't match that shape.
+fn parse_url_ref(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("url(")?.strip_suffix(')')?.trim();
+    // Strip optional quotes.
+    let rest = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+        .or_else(|| rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+        .unwrap_or(rest);
+    rest.strip_prefix('#')
+}
+
+/// Intermediate per-element data captured during the first pass over the
+/// XML tree. Bare-string attributes; defaults and href inheritance are
+/// resolved in a second pass.
+#[derive(Debug, Default, Clone)]
+struct RawGradient {
+    is_linear: bool,
+    href: Option<String>,
+    units: Option<GradientUnits>,
+    spread: Option<SpreadMethod>,
+    x1: Option<f64>,
+    y1: Option<f64>,
+    x2: Option<f64>,
+    y2: Option<f64>,
+    cx: Option<f64>,
+    cy: Option<f64>,
+    fx: Option<f64>,
+    fy: Option<f64>,
+    r: Option<f64>,
+    own_stops: Option<Vec<GradientStop>>,
+    has_transform: bool,
+}
+
+/// Walk the SVG tree, collect every `<linearGradient>` / `<radialGradient>`
+/// into a registry, resolving `xlink:href` / `href` inheritance and
+/// normalising `userSpaceOnUse` coordinates to mm using the same scale
+/// factor we apply to polylines.
+fn parse_gradients(
+    doc: &Document,
+    viewbox: &ViewBox,
+    width_mm: f64,
+    height_mm: f64,
+) -> GradientRegistry {
+    // First pass: raw data per id.
+    let mut raw: HashMap<String, RawGradient> = HashMap::new();
+    for node in doc.descendants() {
+        let name = node.tag_name().name();
+        let is_linear = name == "linearGradient";
+        let is_radial = name == "radialGradient";
+        if !is_linear && !is_radial {
+            continue;
+        }
+        let id = match node.attribute("id") {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let mut g = RawGradient::default();
+        g.is_linear = is_linear;
+        g.href = node
+            .attribute("href")
+            .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")))
+            .and_then(|h| h.strip_prefix('#'))
+            .map(str::to_string);
+        g.units = node.attribute("gradientUnits").and_then(|s| match s {
+            "userSpaceOnUse" => Some(GradientUnits::UserSpaceOnUse),
+            "objectBoundingBox" => Some(GradientUnits::ObjectBoundingBox),
+            _ => None,
+        });
+        g.spread = node.attribute("spreadMethod").and_then(|s| match s {
+            "pad" => Some(SpreadMethod::Pad),
+            "reflect" => Some(SpreadMethod::Reflect),
+            "repeat" => Some(SpreadMethod::Repeat),
+            _ => None,
+        });
+        g.has_transform = node.attribute("gradientTransform").is_some();
+        if g.has_transform {
+            warn!(
+                "gradientTransform on '#{}' is not yet supported; sampling will ignore it",
+                id
+            );
+        }
+        let parse_num = |s: &str| -> Option<f64> {
+            if let Some(p) = s.strip_suffix('%') {
+                p.trim().parse::<f64>().ok().map(|n| n / 100.0)
+            } else {
+                s.trim().parse::<f64>().ok()
+            }
+        };
+        g.x1 = node.attribute("x1").and_then(parse_num);
+        g.y1 = node.attribute("y1").and_then(parse_num);
+        g.x2 = node.attribute("x2").and_then(parse_num);
+        g.y2 = node.attribute("y2").and_then(parse_num);
+        g.cx = node.attribute("cx").and_then(parse_num);
+        g.cy = node.attribute("cy").and_then(parse_num);
+        g.fx = node.attribute("fx").and_then(parse_num);
+        g.fy = node.attribute("fy").and_then(parse_num);
+        g.r = node.attribute("r").and_then(parse_num);
+        let stops = parse_stops(node);
+        if !stops.is_empty() {
+            g.own_stops = Some(stops);
+        }
+        raw.insert(id, g);
+    }
+
+    // Second pass: resolve href to inherit stops/shape attrs. We only
+    // follow one hop (chains of refs would need a topological walk; warn
+    // if we encounter one we can't resolve).
+    let original = raw.clone();
+    for (_, g) in raw.iter_mut() {
+        if let Some(parent_id) = g.href.clone() {
+            if let Some(parent) = original.get(&parent_id) {
+                if g.own_stops.is_none() {
+                    g.own_stops = parent.own_stops.clone();
+                }
+                if g.units.is_none() {
+                    g.units = parent.units;
+                }
+                if g.spread.is_none() {
+                    g.spread = parent.spread;
+                }
+                g.x1 = g.x1.or(parent.x1);
+                g.y1 = g.y1.or(parent.y1);
+                g.x2 = g.x2.or(parent.x2);
+                g.y2 = g.y2.or(parent.y2);
+                g.cx = g.cx.or(parent.cx);
+                g.cy = g.cy.or(parent.cy);
+                g.fx = g.fx.or(parent.fx);
+                g.fy = g.fy.or(parent.fy);
+                g.r = g.r.or(parent.r);
+            }
+        }
+    }
+
+    // Third pass: apply spec defaults, normalise userSpaceOnUse to mm,
+    // build the final Gradient values.
+    let mut registry: GradientRegistry = HashMap::new();
+    for (id, g) in raw {
+        let units = g.units.unwrap_or(GradientUnits::ObjectBoundingBox);
+        let spread = g.spread.unwrap_or(SpreadMethod::Pad);
+        let stops_raw = g.own_stops.unwrap_or_default();
+        if stops_raw.is_empty() {
+            warn!("Gradient '#{}' has no stops; skipping", id);
+            continue;
+        }
+        // Sort stops by offset for the interpolator.
+        let mut stops = stops_raw;
+        stops.sort_by(|a, b| a.offset.partial_cmp(&b.offset).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Spec defaults.
+        let (x1, y1, x2, y2) = (
+            g.x1.unwrap_or(0.0),
+            g.y1.unwrap_or(0.0),
+            g.x2.unwrap_or(1.0),
+            g.y2.unwrap_or(0.0),
+        );
+        let (cx, cy, r) = (g.cx.unwrap_or(0.5), g.cy.unwrap_or(0.5), g.r.unwrap_or(0.5));
+        let (fx, fy) = (g.fx.unwrap_or(cx), g.fy.unwrap_or(cy));
+        if (fx - cx).abs() > 1e-9 || (fy - cy).abs() > 1e-9 {
+            warn!(
+                "Radial gradient '#{}' has offset focal point; approximating with center-only distance",
+                id
+            );
+        }
+
+        // Convert coords to mm when in user space, matching what we do to
+        // polylines elsewhere.
+        let scale_to_mm = |x: f64, y: f64| -> (f64, f64) {
+            match units {
+                GradientUnits::UserSpaceOnUse => (
+                    (x / viewbox.w) * width_mm,
+                    (y / viewbox.h) * height_mm,
+                ),
+                GradientUnits::ObjectBoundingBox => (x, y),
+            }
+        };
+        let scale_len = |v: f64| -> f64 {
+            // Radial r in userSpaceOnUse units: scale by an average of x/y
+            // factors. Anisotropic SVGs are rare; this matches the common
+            // case where width/height share the same per-mm scale.
+            match units {
+                GradientUnits::UserSpaceOnUse => {
+                    let sx = width_mm / viewbox.w;
+                    let sy = height_mm / viewbox.h;
+                    v * 0.5 * (sx + sy)
+                }
+                GradientUnits::ObjectBoundingBox => v,
+            }
+        };
+
+        let shape = if g.is_linear {
+            let (x1, y1) = scale_to_mm(x1, y1);
+            let (x2, y2) = scale_to_mm(x2, y2);
+            GradientShape::Linear { x1, y1, x2, y2 }
+        } else {
+            let (cx, cy) = scale_to_mm(cx, cy);
+            let (fx, fy) = scale_to_mm(fx, fy);
+            let r = scale_len(r);
+            GradientShape::Radial { cx, cy, fx, fy, r }
+        };
+
+        registry.insert(
+            id,
+            Gradient {
+                shape,
+                stops,
+                units,
+                spread,
+            },
+        );
+    }
+    registry
+}
+
+/// Parse `<stop>` children of a gradient element into our GradientStop list.
+fn parse_stops(node: roxmltree::Node) -> Vec<GradientStop> {
+    let mut out = Vec::new();
+    for child in node.children().filter(|c| c.is_element() && c.tag_name().name() == "stop") {
+        let offset = child
+            .attribute("offset")
+            .map(|s| {
+                if let Some(p) = s.strip_suffix('%') {
+                    p.trim().parse::<f64>().unwrap_or(0.0) / 100.0
+                } else {
+                    s.trim().parse::<f64>().unwrap_or(0.0)
+                }
+            })
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+
+        // Stop color and opacity can come from presentation attrs or from
+        // an inline `style="stop-color:...; stop-opacity:..."`.
+        let mut stop_color = child.attribute("stop-color").map(str::to_string);
+        let mut stop_opacity = child
+            .attribute("stop-opacity")
+            .and_then(|s| s.trim().parse::<f64>().ok());
+        if let Some(style) = child.attribute("style") {
+            for decl in style.split(';') {
+                if let Some((k, v)) = decl.split_once(':') {
+                    match k.trim() {
+                        "stop-color" => stop_color = Some(v.trim().to_string()),
+                        "stop-opacity" => {
+                            stop_opacity = v.trim().parse::<f64>().ok().or(stop_opacity);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let color_str = stop_color.unwrap_or_else(|| "black".to_string());
+        let color = match csscolorparser::parse(&color_str) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Could not parse stop-color '{}': {}", color_str, e);
+                csscolorparser::Color::new(0.0, 0.0, 0.0, 1.0)
+            }
+        };
+        let alpha_mult = stop_opacity.unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+        let rgba = [color.r, color.g, color.b, color.a * alpha_mult];
+        out.push(GradientStop { offset, rgba });
+    }
+    out
 }
 
 /// Expand a styled `<path>` into the polylines to engrave (each paired with
@@ -324,6 +852,7 @@ fn expand_path_with_infill(
     sp: StyledPath,
     infill: Option<&InfillSpec>,
     max_power: f64,
+    gradients: &GradientRegistry,
 ) -> Vec<PoweredPolyline> {
     let has_stroke = sp.style.has_stroke();
     let has_fill = sp.style.has_fill();
@@ -344,28 +873,53 @@ fn expand_path_with_infill(
     let emit_outlines = has_stroke
         || matches!(spec.map(|s| s.pattern), Some(InfillPattern::Concentric));
 
-    // Power for outline polylines: stroke color if stroked, else fill color
-    // (we only reach the unstroked-outline branch for concentric infill, and
-    // there the outline serves as the outermost fill ring).
-    let outline_power = if has_stroke {
-        power_from_color(sp.style.stroke.as_deref(), max_power)
-    } else {
-        power_from_color(sp.style.fill.as_deref(), max_power)
+    // The bounding box of this path's polylines is needed both for
+    // objectBoundingBox gradient sampling and for safety against zero-area
+    // paths.
+    let bbox = match polylines_bbox(&sp.polylines) {
+        Some(b) => b,
+        None => return vec![],
     };
-    let infill_power = power_from_color(sp.style.fill.as_deref(), max_power);
 
-    let attach = |power: f64| {
-        move |polyline: Polyline| PoweredPolyline { polyline, power }
+    // Outlines use stroke color (or fall back to fill for the
+    // concentric-no-stroke case where the outline acts as the outermost
+    // ring). Infill always uses fill color.
+    let outline_color = if has_stroke {
+        sp.style.stroke.clone()
+    } else {
+        sp.style.fill.clone()
+    };
+    let infill_color = sp.style.fill.clone();
+
+    // Build a PoweredPolyline by sampling the path's color at the polyline's
+    // centroid. Returns None if the resulting power is non-positive (white
+    // / transparent / unparseable color); such polylines are dropped.
+    let into_powered = |polyline: Polyline, color: Option<&str>| -> Option<PoweredPolyline> {
+        let env = ColorEnv {
+            gradients,
+            bbox,
+            sample: polyline_centroid(&polyline),
+        };
+        let power = power_from_color(color, max_power, &env);
+        if power > 0.0 {
+            Some(PoweredPolyline { polyline, power })
+        } else {
+            None
+        }
     };
 
     let spec = match spec {
         Some(s) => s,
         None => {
             // Stroked-only branch.
-            if !emit_outlines || outline_power <= 0.0 {
+            if !emit_outlines {
                 return vec![];
             }
-            return sp.polylines.into_iter().map(attach(outline_power)).collect();
+            return sp
+                .polylines
+                .into_iter()
+                .filter_map(|pl| into_powered(pl, outline_color.as_deref()))
+                .collect();
         }
     };
 
@@ -421,17 +975,16 @@ fn expand_path_with_infill(
 
     let mut out: Vec<PoweredPolyline> = Vec::new();
 
-    // Outlines first (when we should emit them and their power isn't zero).
-    if emit_outlines && outline_power > 0.0 {
-        out.extend(originals.iter().cloned().map(attach(outline_power)));
+    // Outlines first. Each gets sampled at its own centroid, so a stroke
+    // that varies along a gradient ends up with subpath-by-subpath powers.
+    if emit_outlines {
+        for pl in &originals {
+            if let Some(pp) = into_powered(pl.clone(), outline_color.as_deref()) {
+                out.push(pp);
+            }
+        }
     }
 
-    // Infill polylines come after, all tagged with the fill color's power.
-    // If that power is zero (transparent or white fill), skip generation
-    // entirely — there's nothing to engrave.
-    if infill_power <= 0.0 {
-        return out;
-    }
     for unit in &units {
         let outer_pts: &[CoordinatePair] = &subpaths[unit.outer];
         let hole_pts: Vec<&[CoordinatePair]> = unit
@@ -463,7 +1016,11 @@ fn expand_path_with_infill(
                 spec.wave_period,
             ),
         };
-        out.extend(rings.into_iter().map(attach(infill_power)));
+        for pl in rings {
+            if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                out.push(pp);
+            }
+        }
     }
 
     out
