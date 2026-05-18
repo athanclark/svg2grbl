@@ -264,18 +264,29 @@ fn is_convex(polyline: &Polyline) -> bool {
     sign != 0.0
 }
 
-/// Strip a trailing duplicate of the first vertex if present (svg2polylines'
-/// way of marking a closed loop). Returns the open vertex list.
+/// Open-loop vertex list with adjacent duplicates collapsed. Drops the
+/// trailing closure point (svg2polylines repeats the first vertex on `Z`) as
+/// well as any other consecutive coincident vertices that can come out of
+/// curve flattening — cavalier_contours panics if it sees repeats.
 fn unique_vertices(polyline: &Polyline) -> Vec<CoordinatePair> {
+    const EPS: f64 = 1e-9;
     let pts = polyline.as_ref();
-    if pts.len() >= 2
-        && (pts[0].x - pts[pts.len() - 1].x).abs() < 1e-9
-        && (pts[0].y - pts[pts.len() - 1].y).abs() < 1e-9
-    {
-        pts[..pts.len() - 1].to_vec()
-    } else {
-        pts.clone()
+    let mut out: Vec<CoordinatePair> = Vec::with_capacity(pts.len());
+    for &p in pts {
+        match out.last() {
+            Some(last) if (last.x - p.x).abs() < EPS && (last.y - p.y).abs() < EPS => continue,
+            _ => out.push(p),
+        }
     }
+    // Drop the trailing-close vertex if it coincides with the first.
+    if out.len() >= 2 {
+        let first = out[0];
+        let last = out[out.len() - 1];
+        if (first.x - last.x).abs() < EPS && (first.y - last.y).abs() < EPS {
+            out.pop();
+        }
+    }
+    out
 }
 
 /// Math-convention signed area (positive when vertices are CCW in y-up).
