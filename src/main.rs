@@ -1373,7 +1373,21 @@ fn shape_concentric_infill(
     let slack = step * 0.5;
     let (lo_x, lo_y, hi_x, hi_y) = (min_x - slack, min_y - slack, max_x + slack, max_y + slack);
 
+    // Sum of signed areas across a Shape's polylines. CCW outers contribute
+    // positive area, CW holes contribute negative — so the net is the
+    // shape's actually-enclosed area. A well-behaved inward offset
+    // produces a strictly-decreasing sequence of these values until the
+    // shape collapses; if cavalier's output ever stops shrinking we know
+    // it has drifted into pathological territory.
+    let shape_area = |s: &Shape<f64>| -> f64 {
+        let mut a = 0.0;
+        for p in s.ccw_plines.iter().chain(s.cw_plines.iter()) {
+            a += p.polyline.area();
+        }
+        a
+    };
     let mut current = Shape::from_plines(plines);
+    let mut prev_area = shape_area(&current);
     let mut rings: Vec<Polyline> = Vec::new();
     const MAX_ITERS: usize = 10_000;
     let mut iters = 0;
@@ -1387,6 +1401,27 @@ fn shape_concentric_infill(
         if next.ccw_plines.is_empty() && next.cw_plines.is_empty() {
             break;
         }
+        // cavalier can "overshoot" zero on a thin shape: it then emits
+        // polylines whose orientation is inverted (the offset that should
+        // be CCW comes back CW), and the next iteration grows those
+        // inverted loops outward. Two indicators that we have drifted
+        // into that state:
+        //   1. The net signed area went non-positive — every healthy
+        //      Shape we feed in has a positive net area (outer minus
+        //      holes), and this one no longer does.
+        //   2. The net signed area didn't decrease — even with tolerance
+        //      for floating-point wobble, a well-behaved inward offset
+        //      strictly shrinks the enclosed area.
+        let next_area = shape_area(&next);
+        let tol = (step * step * 0.01).max(1e-9);
+        if next_area <= tol || next_area >= prev_area - tol {
+            warn!(
+                "Offset iteration stopped shrinking healthily (area {:.4} -> {:.4}); halting",
+                prev_area, next_area
+            );
+            break;
+        }
+        prev_area = next_area;
         // Sanity-check the new shape's vertices: anything NaN/infinite, or
         // outside the input's bbox (with small slack), means cavalier
         // produced a runaway offset on a numerically tricky input. We must
