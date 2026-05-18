@@ -527,10 +527,7 @@ fn polyline_centroid(pl: &Polyline) -> CoordinatePair {
         return CoordinatePair::new(0.0, 0.0);
     }
     let n_full = pts.len();
-    let count = if n_full >= 2
-        && (pts[0].x - pts[n_full - 1].x).abs() < 1e-9
-        && (pts[0].y - pts[n_full - 1].y).abs() < 1e-9
-    {
+    let count = if n_full >= 2 && pts_eq(pts[0], pts[n_full - 1]) {
         n_full - 1
     } else {
         n_full
@@ -1223,10 +1220,13 @@ fn expand_path_with_infill(
     out
 }
 
-/// `true` iff a vertex equals its predecessor — used inside the cleanup loop
-/// in [`unique_vertices`].
+/// `true` iff two points are "the same" by cavalier_contours' position
+/// equality tolerance. The offset routines `debug_assert!` that input has no
+/// repeat-position vertices within their `pos_equal_eps` (default 1e-5), so
+/// we need to dedupe at least that aggressively or risk panicking on
+/// near-duplicates produced by curve flattening.
 fn pts_eq(a: CoordinatePair, b: CoordinatePair) -> bool {
-    const EPS: f64 = 1e-9;
+    const EPS: f64 = 1e-5;
     (a.x - b.x).abs() < EPS && (a.y - b.y).abs() < EPS
 }
 
@@ -1345,7 +1345,18 @@ fn shape_concentric_infill(
 
     let mut current = Shape::from_plines(plines);
     let mut rings: Vec<Polyline> = Vec::new();
+    // Safety cap on iterations. A non-degenerate offset shrinks the
+    // enclosed area each iteration and eventually collapses, so this is
+    // only a defence against pathological degenerate inputs cavalier
+    // might not terminate on; well-formed shapes finish well within it.
+    const MAX_ITERS: usize = 10_000;
+    let mut iters = 0;
     loop {
+        if iters >= MAX_ITERS {
+            warn!("Offset iteration hit cap of {} loops; stopping", MAX_ITERS);
+            break;
+        }
+        iters += 1;
         let next = current.parallel_offset(step, ShapeOffsetOptions::new());
         if next.ccw_plines.is_empty() && next.cw_plines.is_empty() {
             break;
