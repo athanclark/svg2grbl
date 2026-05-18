@@ -1343,12 +1343,38 @@ fn shape_concentric_infill(
         plines.push(vertices_to_oriented_cc(hole, false));
     }
 
+    // Establish the input's bbox up front. Subsequent inward offsets should
+    // never produce vertices outside it — if cavalier returns extreme
+    // coordinates (a known failure mode on thin / numerically tricky
+    // inputs), we discard that iteration and stop rather than emit a giant
+    // diagonal across the work area.
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in outer {
+        if p.x < min_x {
+            min_x = p.x;
+        }
+        if p.y < min_y {
+            min_y = p.y;
+        }
+        if p.x > max_x {
+            max_x = p.x;
+        }
+        if p.y > max_y {
+            max_y = p.y;
+        }
+    }
+    // Allow a small slack so we don't reject legitimate floating-point
+    // wobble at convex corners. Half a step is plenty.
+    let slack = step * 0.5;
+    let (lo_x, lo_y, hi_x, hi_y) = (min_x - slack, min_y - slack, max_x + slack, max_y + slack);
+
     let mut current = Shape::from_plines(plines);
     let mut rings: Vec<Polyline> = Vec::new();
-    // Safety cap on iterations. A non-degenerate offset shrinks the
-    // enclosed area each iteration and eventually collapses, so this is
-    // only a defence against pathological degenerate inputs cavalier
-    // might not terminate on; well-formed shapes finish well within it.
     const MAX_ITERS: usize = 10_000;
     let mut iters = 0;
     loop {
@@ -1359,6 +1385,26 @@ fn shape_concentric_infill(
         iters += 1;
         let next = current.parallel_offset(step, ShapeOffsetOptions::new());
         if next.ccw_plines.is_empty() && next.cw_plines.is_empty() {
+            break;
+        }
+        // Sanity-check the new shape's vertices: anything outside the
+        // input's bbox (with small slack) means cavalier produced a
+        // runaway offset on a numerically tricky input; bail.
+        let mut runaway = false;
+        for ipl in next.ccw_plines.iter().chain(next.cw_plines.iter()) {
+            for i in 0..ipl.polyline.vertex_count() {
+                let v = ipl.polyline.at(i);
+                if v.x < lo_x || v.x > hi_x || v.y < lo_y || v.y > hi_y {
+                    runaway = true;
+                    break;
+                }
+            }
+            if runaway {
+                break;
+            }
+        }
+        if runaway {
+            warn!("Discarding degenerate offset iteration with out-of-bbox vertices");
             break;
         }
         for ipl in &next.ccw_plines {
