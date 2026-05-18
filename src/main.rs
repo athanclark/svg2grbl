@@ -1128,7 +1128,10 @@ fn expand_path_with_infill(
     }
 
     // Classify each subpath by containment depth. Depth-even subpaths are
-    // filled outers; depth-odd are holes of their nearest even-depth ancestor.
+    // filled outers; depth-odd are holes of their nearest even-depth
+    // ancestor. Concentric infill uses these splits; scan-line infill
+    // (parallel/cross/wavy) processes all subpaths together via even-odd
+    // parity and doesn't depend on the classification.
     let depths = containment_depths(&subpaths);
 
     struct ShapeUnit {
@@ -1180,40 +1183,66 @@ fn expand_path_with_infill(
         }
     }
 
-    for unit in &units {
-        let outer_pts: &[CoordinatePair] = &subpaths[unit.outer];
-        let hole_pts: Vec<&[CoordinatePair]> = unit
-            .holes
-            .iter()
-            .map(|&i| subpaths[i].as_slice())
-            .filter(|s| s.len() >= 3)
-            .collect();
-        let rings = match spec.pattern {
-            InfillPattern::Concentric => shape_concentric_infill(outer_pts, &hole_pts, spec.step),
-            InfillPattern::Parallel => parallel_infill(outer_pts, &hole_pts, spec.step, spec.angle_deg),
-            InfillPattern::Cross => {
-                let mut lines =
-                    parallel_infill(outer_pts, &hole_pts, spec.step, spec.angle_deg);
-                lines.extend(parallel_infill(
-                    outer_pts,
-                    &hole_pts,
-                    spec.step,
-                    spec.angle_deg + 90.0,
-                ));
-                lines
+    // Scan-line patterns (parallel/cross/wavy) work correctly via SVG's
+    // even-odd fill rule when *all* of the path's subpaths contribute their
+    // intersections together. That sidesteps containment-classification
+    // entirely — useful because Inkscape text-to-path output frequently
+    // has 3+ levels of nested subpaths whose proper outer/hole assignment
+    // is fragile. Concentric still needs the cavalier Shape (outer +
+    // holes) split, so it stays per-unit.
+    let all_subpaths: Vec<&[CoordinatePair]> = subpaths
+        .iter()
+        .map(|s| s.as_slice())
+        .filter(|s| s.len() >= 3)
+        .collect();
+    match spec.pattern {
+        InfillPattern::Concentric => {
+            for unit in &units {
+                let outer_pts: &[CoordinatePair] = &subpaths[unit.outer];
+                let hole_pts: Vec<&[CoordinatePair]> = unit
+                    .holes
+                    .iter()
+                    .map(|&i| subpaths[i].as_slice())
+                    .filter(|s| s.len() >= 3)
+                    .collect();
+                let rings = shape_concentric_infill(outer_pts, &hole_pts, spec.step);
+                for pl in rings {
+                    if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                        out.push(pp);
+                    }
+                }
             }
-            InfillPattern::Wavy => wavy_infill(
-                outer_pts,
-                &hole_pts,
+        }
+        InfillPattern::Parallel => {
+            for pl in parallel_infill_all(&all_subpaths, spec.step, spec.angle_deg) {
+                if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                    out.push(pp);
+                }
+            }
+        }
+        InfillPattern::Cross => {
+            for pl in parallel_infill_all(&all_subpaths, spec.step, spec.angle_deg) {
+                if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                    out.push(pp);
+                }
+            }
+            for pl in parallel_infill_all(&all_subpaths, spec.step, spec.angle_deg + 90.0) {
+                if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                    out.push(pp);
+                }
+            }
+        }
+        InfillPattern::Wavy => {
+            for pl in wavy_infill_all(
+                &all_subpaths,
                 spec.step,
                 spec.angle_deg,
                 spec.wave_amplitude,
                 spec.wave_period,
-            ),
-        };
-        for pl in rings {
-            if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
-                out.push(pp);
+            ) {
+                if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                    out.push(pp);
+                }
             }
         }
     }
@@ -1542,47 +1571,44 @@ fn has_anomalous_closing_chord(pl: &CcPolyline<f64>) -> bool {
     close_len > 6.0 * median
 }
 
-/// Straight-line scan-line infill of the polygon-with-holes. Each scan line
-/// produces zero or more 2-point polylines, one per "in-out" segment pair
-/// from the scan's intersections with edges of the outer and the holes.
-/// Lines alternate direction (boustrophedon) to minimise pen-up travel.
-fn parallel_infill(
-    outer: &[CoordinatePair],
-    holes: &[&[CoordinatePair]],
+/// Even-odd scan-line infill over all of a path's subpaths together. Each
+/// scan line collects intersections from every subpath, sorts them, and
+/// pairs in/out to produce filled segments — which matches SVG's evenodd
+/// fill rule (and equals nonzero for properly-wound text-to-path output).
+/// This sidesteps containment classification: nested holes-of-holes, weird
+/// overlapping strokes, and similar cases just fall out of the parity
+/// count. Lines alternate direction (boustrophedon) to minimise pen-up
+/// travel.
+fn parallel_infill_all(
+    subpaths: &[&[CoordinatePair]],
     step: f64,
     angle_deg: f64,
 ) -> Vec<Polyline> {
     let theta = angle_deg.to_radians();
     let (s, c) = (theta.sin(), theta.cos());
 
-    // Rotate by -theta so the scan direction becomes the +X axis (and so
-    // "horizontal scan lines" become lines of constant y in the rotated
-    // frame). Inverse rotation is +theta.
+    // Rotate by -theta so the scan direction becomes the +X axis.
     let rot = |p: CoordinatePair| CoordinatePair::new(c * p.x + s * p.y, -s * p.x + c * p.y);
     let unrot =
         |p: CoordinatePair| CoordinatePair::new(c * p.x - s * p.y, s * p.x + c * p.y);
 
-    let outer_rot: Vec<CoordinatePair> = outer.iter().copied().map(rot).collect();
-    let holes_rot: Vec<Vec<CoordinatePair>> = holes
+    let subs_rot: Vec<Vec<CoordinatePair>> = subpaths
         .iter()
-        .map(|h| h.iter().copied().map(rot).collect())
+        .map(|s| s.iter().copied().map(rot).collect())
         .collect();
 
-    let (ymin, ymax) = match y_bounds(&outer_rot) {
+    let (ymin, ymax) = match union_y_bounds(&subs_rot) {
         Some(b) => b,
         None => return vec![],
     };
 
     let mut polylines = Vec::new();
-    // Offset the first line a half-step in from the edge so we don't try to
-    // scan exactly along a vertex or edge.
     let mut y = ymin + step * 0.5;
     let mut flip = false;
     while y < ymax {
         let mut xs: Vec<f64> = Vec::new();
-        push_scan_intersections(&outer_rot, y, &mut xs);
-        for h in &holes_rot {
-            push_scan_intersections(h, y, &mut xs);
+        for s in &subs_rot {
+            push_scan_intersections(s, y, &mut xs);
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         for chunk in xs.chunks_exact(2) {
@@ -1599,13 +1625,10 @@ fn parallel_infill(
     polylines
 }
 
-/// Like [`parallel_infill`], but each filled segment is sampled along a
-/// sine wave: `y_sample = scan_y + amplitude * sin(2π * x / period)`. The
-/// wave's centerline is the scan line, so the segment endpoints sit exactly
-/// on the polygon boundary in the rotated frame.
-fn wavy_infill(
-    outer: &[CoordinatePair],
-    holes: &[&[CoordinatePair]],
+/// Like [`parallel_infill_all`], but each filled segment is sampled along
+/// a sine wave: `y_sample = scan_y + amplitude * sin(2π * x / period)`.
+fn wavy_infill_all(
+    subpaths: &[&[CoordinatePair]],
     step: f64,
     angle_deg: f64,
     amplitude: f64,
@@ -1617,18 +1640,16 @@ fn wavy_infill(
     let unrot =
         |p: CoordinatePair| CoordinatePair::new(c * p.x - s * p.y, s * p.x + c * p.y);
 
-    let outer_rot: Vec<CoordinatePair> = outer.iter().copied().map(rot).collect();
-    let holes_rot: Vec<Vec<CoordinatePair>> = holes
+    let subs_rot: Vec<Vec<CoordinatePair>> = subpaths
         .iter()
-        .map(|h| h.iter().copied().map(rot).collect())
+        .map(|s| s.iter().copied().map(rot).collect())
         .collect();
 
-    let (ymin, ymax) = match y_bounds(&outer_rot) {
+    let (ymin, ymax) = match union_y_bounds(&subs_rot) {
         Some(b) => b,
         None => return vec![],
     };
 
-    // Sample density: small enough to keep the sine looking smooth.
     let sample_step = (period / 16.0).max(1e-3);
 
     let mut polylines = Vec::new();
@@ -1636,9 +1657,8 @@ fn wavy_infill(
     let mut flip = false;
     while y < ymax {
         let mut xs: Vec<f64> = Vec::new();
-        push_scan_intersections(&outer_rot, y, &mut xs);
-        for h in &holes_rot {
-            push_scan_intersections(h, y, &mut xs);
+        for s in &subs_rot {
+            push_scan_intersections(s, y, &mut xs);
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         for chunk in xs.chunks_exact(2) {
@@ -1650,6 +1670,23 @@ fn wavy_infill(
         y += step;
     }
     polylines
+}
+
+/// Y-bounds of the union of multiple subpaths' vertices.
+fn union_y_bounds(subpaths: &[Vec<CoordinatePair>]) -> Option<(f64, f64)> {
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for s in subpaths {
+        for p in s {
+            ymin = ymin.min(p.y);
+            ymax = ymax.max(p.y);
+        }
+    }
+    if !ymin.is_finite() || !ymax.is_finite() || ymax - ymin <= 0.0 {
+        None
+    } else {
+        Some((ymin, ymax))
+    }
 }
 
 /// Generate the sampled points of a single sine-wave segment from `x0` to
@@ -1689,22 +1726,6 @@ fn sine_samples(
     }
     pts.push(CoordinatePair::new(b, y));
     pts
-}
-
-/// y-range of a polygon's vertices in the rotated frame. Returns None for
-/// degenerate (empty or vanishingly thin) input.
-fn y_bounds(verts: &[CoordinatePair]) -> Option<(f64, f64)> {
-    let mut ymin = f64::INFINITY;
-    let mut ymax = f64::NEG_INFINITY;
-    for p in verts {
-        ymin = ymin.min(p.y);
-        ymax = ymax.max(p.y);
-    }
-    if !ymin.is_finite() || !ymax.is_finite() || ymax - ymin <= 0.0 {
-        None
-    } else {
-        Some((ymin, ymax))
-    }
 }
 
 /// Push the x-coordinates of every intersection of the horizontal line
