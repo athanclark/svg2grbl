@@ -251,16 +251,43 @@ struct InfillSpec {
     wave_period: f64,
 }
 
-/// Expand a styled `<path>` into the polylines to engrave. For filled paths
-/// with `infill` set, this includes the outline of every subpath plus the
-/// chosen infill pattern's polylines for the polygon-with-holes (holes are
-/// detected by containment within the same `<path>`). For unfilled paths,
-/// or when no infill is requested, the subpath outlines pass through
-/// unchanged.
+/// Expand a styled `<path>` into the polylines to engrave, observing the
+/// path's stroke and fill states:
+///
+/// - **Stroked path**: subpath outlines are always engraved.
+/// - **Filled-but-not-stroked path** with `--infill`:
+///   - `concentric`: outlines are still emitted, because the outer boundary
+///     *is* the outermost concentric ring (needed for 100% coverage).
+///   - `parallel`/`cross`/`wavy`: only the scan-line/wave segments are
+///     emitted; outlines are skipped so the engraving is "fill only".
+/// - **Path with neither stroke nor fill** (or filled but `--infill` unset
+///   and not stroked): contributes nothing.
 fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<Polyline> {
+    let has_stroke = sp.style.has_stroke();
+    let has_fill = sp.style.has_fill();
     let spec = match infill {
-        Some(s) if sp.style.has_fill() => s,
-        _ => return sp.polylines,
+        Some(s) if has_fill => Some(s),
+        _ => None,
+    };
+
+    // Fast path: nothing to do. Filled-only-no-infill is included here on
+    // purpose — the user opted out of both stroke and infill.
+    if !has_stroke && spec.is_none() {
+        return vec![];
+    }
+
+    // When stroke is absent we still emit outlines for concentric infill so
+    // the outermost ring (= the outline itself) is engraved and the area is
+    // fully covered.
+    let emit_outlines = has_stroke
+        || matches!(spec.map(|s| s.pattern), Some(InfillPattern::Concentric));
+
+    let spec = match spec {
+        Some(s) => s,
+        None => {
+            // Stroked-only branch: just pass the subpath outlines through.
+            return if emit_outlines { sp.polylines } else { vec![] };
+        }
     };
 
     // Clean each subpath to a unique-vertex loop. Subpaths that don't form a
@@ -315,9 +342,13 @@ fn expand_path_with_infill(sp: StyledPath, infill: Option<&InfillSpec>) -> Vec<P
 
     let mut out: Vec<Polyline> = Vec::new();
 
-    // Outlines first, in source order, so the engraver does outline then infill.
-    for pl in &originals {
-        out.push(pl.clone());
+    // Outlines first, in source order, so the engraver does outline then
+    // infill — but only when stroke is present, or when the pattern is
+    // concentric (in which case the outline doubles as the outermost ring).
+    if emit_outlines {
+        for pl in &originals {
+            out.push(pl.clone());
+        }
     }
 
     for unit in &units {
