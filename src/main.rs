@@ -240,12 +240,25 @@ fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<V
     }
 
     let mut gcodes = vec![];
-    gcodes.push("M4".to_owned());
+    // Keep the laser explicitly disabled while positioning at the start of
+    // each polyline.  This matters for clipped scan-line infill: consecutive
+    // polylines often sit on opposite sides of a hole, so their intervening
+    // G0 crosses an area that must not be engraved.  Starting M4 before G0
+    // relied on GRBL laser mode ($32=1) to suppress power during rapids and
+    // could burn straight across holes on other configurations/controllers.
+    gcodes.push("M5".to_owned());
     let first_coord = coordinates[0];
     gcodes.push(format!("G0 X{} Y{}", first_coord.x, first_coord.y));
+    // S is modal.  Set it to zero when arming M4 so a previous polyline's
+    // power cannot burn a stationary dot before the first G1 begins.
+    gcodes.push("M4 S0".to_owned());
     for next_coord in &coordinates[1..] {
         gcodes.push(format!("G1 X{} Y{} F{speed} S{strength}", next_coord.x, next_coord.y));
     }
+    // Clear modal power before stopping the laser. Some controllers/senders
+    // can otherwise carry the previous S value briefly into the following
+    // positioning move even though it is preceded by M5.
+    gcodes.push("S0".to_owned());
     gcodes.push("M5".to_owned());
 
     Ok(gcodes)
@@ -1127,49 +1140,10 @@ fn expand_path_with_infill(
         subpaths.push(verts);
     }
 
-    // Classify each subpath by containment depth. Depth-even subpaths are
-    // filled outers; depth-odd are holes of their nearest even-depth
-    // ancestor. Concentric infill uses these splits; scan-line infill
-    // (parallel/cross/wavy) processes all subpaths together via even-odd
-    // parity and doesn't depend on the classification.
+    // Classify each subpath by containment depth. Concentric infill uses the
+    // depth parity to orient filled outers/islands opposite their holes;
+    // scan-line patterns use even-odd intersections directly.
     let depths = containment_depths(&subpaths);
-
-    struct ShapeUnit {
-        outer: usize,
-        holes: Vec<usize>,
-    }
-    let mut units: Vec<ShapeUnit> = Vec::new();
-    for (i, &d) in depths.iter().enumerate() {
-        if d % 2 == 0 && subpaths[i].len() >= 3 {
-            units.push(ShapeUnit {
-                outer: i,
-                holes: Vec::new(),
-            });
-        }
-    }
-    for (i, &d) in depths.iter().enumerate() {
-        if d % 2 == 0 || subpaths[i].len() < 3 {
-            continue;
-        }
-        // Attach this hole to its immediate parent (depth d-1) outer.
-        // Use the same multi-sample containment test as depth assignment
-        // so the two stay consistent on tricky cursive geometry.
-        let mut best: Option<(usize, usize)> = None;
-        for (u_idx, unit) in units.iter().enumerate() {
-            let parent_d = depths[unit.outer];
-            if parent_d + 1 != d {
-                continue;
-            }
-            if subpath_contained_in(&subpaths[i], &subpaths[unit.outer])
-                && best.map_or(true, |(_, bd)| parent_d > bd)
-            {
-                best = Some((u_idx, parent_d));
-            }
-        }
-        if let Some((u_idx, _)) = best {
-            units[u_idx].holes.push(i);
-        }
-    }
 
     let mut out: Vec<PoweredPolyline> = Vec::new();
 
@@ -1183,33 +1157,22 @@ fn expand_path_with_infill(
         }
     }
 
-    // Scan-line patterns (parallel/cross/wavy) work correctly via SVG's
-    // even-odd fill rule when *all* of the path's subpaths contribute their
-    // intersections together. That sidesteps containment-classification
-    // entirely — useful because Inkscape text-to-path output frequently
-    // has 3+ levels of nested subpaths whose proper outer/hole assignment
-    // is fragile. Concentric still needs the cavalier Shape (outer +
-    // holes) split, so it stays per-unit.
-    let all_subpaths: Vec<&[CoordinatePair]> = subpaths
-        .iter()
-        .map(|s| s.as_slice())
-        .filter(|s| s.len() >= 3)
-        .collect();
+    // Every pattern processes the complete compound path. Scan-line patterns
+    // combine all intersections via even-odd parity; concentric builds one
+    // globally oriented Shape so topology changes are resolved together.
+    let mut all_subpaths: Vec<&[CoordinatePair]> = Vec::with_capacity(subpaths.len());
+    let mut all_depths: Vec<usize> = Vec::with_capacity(subpaths.len());
+    for (subpath, &depth) in subpaths.iter().zip(&depths) {
+        if subpath.len() >= 3 {
+            all_subpaths.push(subpath.as_slice());
+            all_depths.push(depth);
+        }
+    }
     match spec.pattern {
         InfillPattern::Concentric => {
-            for unit in &units {
-                let outer_pts: &[CoordinatePair] = &subpaths[unit.outer];
-                let hole_pts: Vec<&[CoordinatePair]> = unit
-                    .holes
-                    .iter()
-                    .map(|&i| subpaths[i].as_slice())
-                    .filter(|s| s.len() >= 3)
-                    .collect();
-                let rings = shape_concentric_infill(outer_pts, &hole_pts, spec.step);
-                for pl in rings {
-                    if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
-                        out.push(pp);
-                    }
+            for pl in shape_concentric_infill(&all_subpaths, &all_depths, spec.step) {
+                if let Some(pp) = into_powered(pl, infill_color.as_deref()) {
+                    out.push(pp);
                 }
             }
         }
@@ -1374,141 +1337,86 @@ fn subpath_contained_in(a: &[CoordinatePair], b: &[CoordinatePair]) -> bool {
     inside * 2 > samples
 }
 
-/// Build a cavalier `Shape` for a single filled region (one outer + its
-/// immediate holes), then iteratively offset inward by `step` until the
-/// shape collapses. The boundary loops in the input are not returned; only
-/// the resulting inset rings are.
+/// Build one cavalier `Shape` for all contours of a compound path, then
+/// generate independent inward offsets at multiples of `step`. The boundary
+/// loops in the input are not returned; only the resulting inset rings are.
 fn shape_concentric_infill(
-    outer: &[CoordinatePair],
-    holes: &[&[CoordinatePair]],
+    subpaths: &[&[CoordinatePair]],
+    depths: &[usize],
     step: f64,
 ) -> Vec<Polyline> {
-    if outer.len() < 3 || signed_area(outer).abs() < 1e-12 {
+    if subpaths.is_empty() || subpaths.len() != depths.len() {
         return vec![];
     }
 
-    // Build a Shape with outer forced to CCW (positive math area) and each
-    // hole forced to CW (negative math area). Shape::from_plines classifies
-    // based on area sign, so getting orientations right is what tells
-    // cavalier which loop is filled and which is a hole.
-    let outer_pl = vertices_to_oriented_cc(outer, true);
-    let mut plines: Vec<CcPolyline<f64>> = vec![outer_pl];
-    for &hole in holes {
-        if hole.len() < 3 {
+    // Shape classifies loops by orientation. Even-depth contours are filled
+    // outers/islands and must be CCW; odd-depth contours are holes and must
+    // be CW. Keeping every contour in one Shape lets topology changes (holes
+    // merging into outers, islands collapsing, etc.) resolve globally.
+    let mut plines: Vec<CcPolyline<f64>> = Vec::with_capacity(subpaths.len());
+    for (&subpath, &depth) in subpaths.iter().zip(depths) {
+        if subpath.len() < 3 || signed_area(subpath).abs() < 1e-12 {
             continue;
         }
-        plines.push(vertices_to_oriented_cc(hole, false));
+        plines.push(vertices_to_oriented_cc(subpath, depth % 2 == 0));
+    }
+    if plines.is_empty() {
+        return vec![];
     }
 
-    // Establish the input's bbox up front. Subsequent inward offsets should
-    // never produce vertices outside it — if cavalier returns extreme
-    // coordinates (a known failure mode on thin / numerically tricky
-    // inputs), we discard that iteration and stop rather than emit a giant
-    // diagonal across the work area.
+    // Establish a conservative upper bound for the offset distance. No
+    // non-empty inset can survive beyond the source bounding-box diagonal.
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (
         f64::INFINITY,
         f64::INFINITY,
         f64::NEG_INFINITY,
         f64::NEG_INFINITY,
     );
-    for p in outer {
-        if p.x < min_x {
-            min_x = p.x;
-        }
-        if p.y < min_y {
-            min_y = p.y;
-        }
-        if p.x > max_x {
-            max_x = p.x;
-        }
-        if p.y > max_y {
-            max_y = p.y;
+    for subpath in subpaths {
+        for p in *subpath {
+            if p.x < min_x {
+                min_x = p.x;
+            }
+            if p.y < min_y {
+                min_y = p.y;
+            }
+            if p.x > max_x {
+                max_x = p.x;
+            }
+            if p.y > max_y {
+                max_y = p.y;
+            }
         }
     }
-    // Allow a small slack so we don't reject legitimate floating-point
-    // wobble at convex corners. Half a step is plenty.
-    let slack = step * 0.5;
-    let (lo_x, lo_y, hi_x, hi_y) = (min_x - slack, min_y - slack, max_x + slack, max_y + slack);
+    let max_offset = (max_x - min_x).hypot(max_y - min_y);
+    let max_iters = ((max_offset / step).ceil() as usize).min(10_000);
 
-    // Sum of signed areas across a Shape's polylines. CCW outers contribute
-    // positive area, CW holes contribute negative — so the net is the
-    // shape's actually-enclosed area. A well-behaved inward offset
-    // produces a strictly-decreasing sequence of these values until the
-    // shape collapses; if cavalier's output ever stops shrinking we know
-    // it has drifted into pathological territory.
-    let shape_area = |s: &Shape<f64>| -> f64 {
-        let mut a = 0.0;
-        for p in s.ccw_plines.iter().chain(s.cw_plines.iter()) {
-            a += p.polyline.area();
-        }
-        a
-    };
-    let mut current = Shape::from_plines(plines);
-    let mut prev_area = shape_area(&current);
+    let source = Shape::from_plines(plines);
     let mut rings: Vec<Polyline> = Vec::new();
-    const MAX_ITERS: usize = 10_000;
-    let mut iters = 0;
-    loop {
-        if iters >= MAX_ITERS {
-            warn!("Offset iteration hit cap of {} loops; stopping", MAX_ITERS);
-            break;
-        }
-        iters += 1;
-        let next = current.parallel_offset(step, ShapeOffsetOptions::new());
+    // Cavalier represents rounded offset joins as bulge (circular-arc)
+    // segments.  Flatten them to at most one tenth of the infill spacing so
+    // the emitted G-code follows the actual offset instead of connecting arc
+    // endpoints with chords.
+    let arc_error = (step * 0.1).max(1e-5);
+    // Always offset from the original shape at n * step. Feeding one offset
+    // back into the next accumulates numerical damage; a single malformed
+    // iteration then contaminates every remaining ring and used to make the
+    // infill stop early. Independent offsets let a bad candidate be rejected
+    // without losing later, valid regions.
+    let mut consecutive_empty = 0usize;
+    for iteration in 1..=max_iters {
+        let distance = iteration as f64 * step;
+        let next = source.parallel_offset(distance, ShapeOffsetOptions::new());
         if next.ccw_plines.is_empty() && next.cw_plines.is_empty() {
-            break;
-        }
-        // cavalier can "overshoot" zero on a thin shape: it then emits
-        // polylines whose orientation is inverted (the offset that should
-        // be CCW comes back CW), and the next iteration grows those
-        // inverted loops outward. Two indicators that we have drifted
-        // into that state:
-        //   1. The net signed area went non-positive — every healthy
-        //      Shape we feed in has a positive net area (outer minus
-        //      holes), and this one no longer does.
-        //   2. The net signed area didn't decrease — even with tolerance
-        //      for floating-point wobble, a well-behaved inward offset
-        //      strictly shrinks the enclosed area.
-        let next_area = shape_area(&next);
-        let tol = (step * step * 0.01).max(1e-9);
-        if next_area <= tol || next_area >= prev_area - tol {
-            warn!(
-                "Offset iteration stopped shrinking healthily (area {:.4} -> {:.4}); halting",
-                prev_area, next_area
-            );
-            break;
-        }
-        prev_area = next_area;
-        // Sanity-check the new shape's vertices: anything NaN/infinite, or
-        // outside the input's bbox (with small slack), means cavalier
-        // produced a runaway offset on a numerically tricky input. We must
-        // check `!is_finite()` explicitly because NaN comparisons return
-        // false for both `<` and `>`, so a NaN vertex would otherwise be
-        // passed back as the next iteration's input and trip an `assert!`
-        // deep inside cavalier's spatial-index builder.
-        let mut runaway = false;
-        for ipl in next.ccw_plines.iter().chain(next.cw_plines.iter()) {
-            for i in 0..ipl.polyline.vertex_count() {
-                let v = ipl.polyline.at(i);
-                let bad = !v.x.is_finite()
-                    || !v.y.is_finite()
-                    || v.x < lo_x
-                    || v.x > hi_x
-                    || v.y < lo_y
-                    || v.y > hi_y;
-                if bad {
-                    runaway = true;
-                    break;
-                }
-            }
-            if runaway {
+            consecutive_empty += 1;
+            // Requiring several empty distances avoids stopping on a single
+            // transient library failure at a topology transition.
+            if consecutive_empty >= 3 {
                 break;
             }
+            continue;
         }
-        if runaway {
-            warn!("Discarding degenerate offset iteration with bad vertices");
-            break;
-        }
+        consecutive_empty = 0;
         for ipl in next.ccw_plines.iter().chain(next.cw_plines.iter()) {
             // Skip degenerate "spike" polylines (e.g. 2 distinct vertices
             // marked is_closed → A→B→A zero-area segment) that cavalier
@@ -1516,59 +1424,51 @@ fn shape_concentric_infill(
             if ipl.polyline.vertex_count() < 3 {
                 continue;
             }
-            // Cavalier emits closed polylines whose first and last vertex_data
-            // entries are joined by an implicit closing chord. On numerically
-            // tricky inputs that chord can be huge, even though the rest of the
-            // edges trace a fine offset — the polyline ends up as a thin sliver
-            // with one anomalous diagonal jump back to the start. Reject any
-            // polyline whose implicit closing edge is dramatically longer than
-            // its other edges.
-            if has_anomalous_closing_chord(&ipl.polyline) {
-                warn!("Discarding offset polyline with anomalous closing chord");
+            let ring = cc_polyline_to_polyline(&ipl.polyline, arc_error);
+            // Validate the actual flattened toolpath, including the implicit
+            // closing segment.  A length-based closing-chord heuristic cannot
+            // distinguish a malformed jump from a legitimate long straight
+            // edge on a path whose curves have many short vertices.  Sampling
+            // against the source fill catches the failure we care about
+            // directly: an engraving move through a hole or outside the outer.
+            if !polyline_stays_in_fill(&ring, subpaths, step * 0.5) {
+                warn!("Discarding offset polyline that leaves the source fill");
                 continue;
             }
-            rings.push(cc_polyline_to_polyline(&ipl.polyline));
+            rings.push(ring);
         }
-        current = next;
     }
     rings
 }
 
-/// `true` iff the implicit closing chord (`last vertex → first vertex`) is
-/// dramatically longer than any other edge in the loop. Well-formed offset
-/// polylines have edges of roughly similar length all the way around
-/// because cavalier's internal flattening tolerance is uniform; a closing
-/// chord several times longer than the longest other edge means the loop
-/// didn't actually close on itself and the gcode would draw a long stray
-/// diagonal across the work.
-fn has_anomalous_closing_chord(pl: &CcPolyline<f64>) -> bool {
-    let n = pl.vertex_count();
-    if n < 3 {
+/// Verify that every engraving segment in a closed offset polyline remains
+/// in the even-odd fill of the complete compound path. Sampling is bounded
+/// by `sample_step`, so even a long malformed closing segment is checked
+/// along its full length rather than only at its endpoints.
+fn polyline_stays_in_fill(
+    pl: &Polyline,
+    subpaths: &[&[CoordinatePair]],
+    sample_step: f64,
+) -> bool {
+    let pts = pl.as_ref();
+    if pts.len() < 2 {
         return false;
     }
-    // Use the median internal edge length as the baseline. cavalier emits
-    // near-duplicate vertex pairs at slice joins, so the max edge can
-    // already be many times the typical edge — comparing against the
-    // median is more robust. A clean closed offset has close-chord length
-    // within a small factor of the median; a chord 6× the median is
-    // qualitatively out of family with the rest of the loop.
-    let mut edges: Vec<f64> = (0..n - 1)
-        .map(|i| {
-            let a = pl.at(i);
-            let b = pl.at(i + 1);
-            let dx = b.x - a.x;
-            let dy = b.y - a.y;
-            (dx * dx + dy * dy).sqrt()
+    pts.windows(2).all(|edge| {
+        let (a, b) = (edge[0], edge[1]);
+        let length = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+        let samples = (length / sample_step.max(1e-5)).ceil().max(1.0) as usize;
+        (0..samples).all(|i| {
+            let t = (i as f64 + 0.5) / samples as f64;
+            let p = CoordinatePair::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+            subpaths
+                .iter()
+                .filter(|subpath| point_in_polygon(p, subpath))
+                .count()
+                % 2
+                == 1
         })
-        .collect();
-    edges.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = edges[edges.len() / 2].max(1e-9);
-    let first = pl.at(0);
-    let last = pl.at(n - 1);
-    let cdx = first.x - last.x;
-    let cdy = first.y - last.y;
-    let close_len = (cdx * cdx + cdy * cdy).sqrt();
-    close_len > 6.0 * median
+    })
 }
 
 /// Even-odd scan-line infill over all of a path's subpaths together. Each
@@ -1611,13 +1511,23 @@ fn parallel_infill_all(
             push_scan_intersections(s, y, &mut xs);
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for chunk in xs.chunks_exact(2) {
-            let (x0, x1) = (chunk[0], chunk[1]);
-            let (a, b) = if flip { (x1, x0) } else { (x0, x1) };
-            polylines.push(Polyline::from_vec(vec![
-                unrot(CoordinatePair::new(a, y)),
-                unrot(CoordinatePair::new(b, y)),
-            ]));
+        if flip {
+            // Reverse both each segment and the order of the segments. Merely
+            // reversing their endpoints leaves the list ordered left-to-right,
+            // which makes every between-hole positioning move travel rightward.
+            for chunk in xs.chunks_exact(2).rev() {
+                polylines.push(Polyline::from_vec(vec![
+                    unrot(CoordinatePair::new(chunk[1], y)),
+                    unrot(CoordinatePair::new(chunk[0], y)),
+                ]));
+            }
+        } else {
+            for chunk in xs.chunks_exact(2) {
+                polylines.push(Polyline::from_vec(vec![
+                    unrot(CoordinatePair::new(chunk[0], y)),
+                    unrot(CoordinatePair::new(chunk[1], y)),
+                ]));
+            }
         }
         flip = !flip;
         y += step;
@@ -1661,10 +1571,20 @@ fn wavy_infill_all(
             push_scan_intersections(s, y, &mut xs);
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for chunk in xs.chunks_exact(2) {
-            let (x0, x1) = (chunk[0], chunk[1]);
-            let pts = sine_samples(x0, x1, y, amplitude, period, sample_step, flip);
-            polylines.push(Polyline::from_vec(pts.into_iter().map(unrot).collect()));
+        if flip {
+            for chunk in xs.chunks_exact(2).rev() {
+                let pts = sine_samples(
+                    chunk[0], chunk[1], y, amplitude, period, sample_step, true,
+                );
+                polylines.push(Polyline::from_vec(pts.into_iter().map(unrot).collect()));
+            }
+        } else {
+            for chunk in xs.chunks_exact(2) {
+                let pts = sine_samples(
+                    chunk[0], chunk[1], y, amplitude, period, sample_step, false,
+                );
+                polylines.push(Polyline::from_vec(pts.into_iter().map(unrot).collect()));
+            }
         }
         flip = !flip;
         y += step;
@@ -1770,11 +1690,14 @@ fn vertices_to_oriented_cc(verts: &[CoordinatePair], make_ccw: bool) -> CcPolyli
 /// Convert a closed cavalier polyline back to an svg2polylines `Polyline`,
 /// repeating the first vertex at the end so downstream g-code emission draws
 /// the closing segment.
-fn cc_polyline_to_polyline(pl: &CcPolyline<f64>) -> Polyline {
-    let n = pl.vertex_count();
+fn cc_polyline_to_polyline(pl: &CcPolyline<f64>, arc_error: f64) -> Polyline {
+    let flattened = pl
+        .arcs_to_approx_lines(arc_error)
+        .expect("finite f64 arc flattening parameters");
+    let n = flattened.vertex_count();
     let mut pts: Vec<CoordinatePair> = Vec::with_capacity(n + 1);
     for i in 0..n {
-        let v: PlineVertex<f64> = pl.at(i);
+        let v: PlineVertex<f64> = flattened.at(i);
         pts.push(CoordinatePair::new(v.x, v.y));
     }
     if let Some(first) = pts.first().copied() {
@@ -1809,3 +1732,122 @@ pub fn length_to_mm(s: &str, dpi: f64, font_px: f64) -> Result<f64, String> {
     Ok(mm)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<CoordinatePair> {
+        vec![
+            CoordinatePair::new(x0, y0),
+            CoordinatePair::new(x1, y0),
+            CoordinatePair::new(x1, y1),
+            CoordinatePair::new(x0, y1),
+        ]
+    }
+
+    #[test]
+    fn g0_positioning_happens_with_laser_off() {
+        let gcode = polyline2gcode(
+            Polyline::from_vec(vec![
+                CoordinatePair::new(1.0, 2.0),
+                CoordinatePair::new(3.0, 4.0),
+            ]),
+            500.0,
+            200.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            gcode,
+            [
+                "M5",
+                "G0 X1 Y2",
+                "M4 S0",
+                "G1 X3 Y4 F200 S500",
+                "S0",
+                "M5",
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_infill_splits_scan_line_at_hole() {
+        let outer = square(0.0, 0.0, 10.0, 10.0);
+        let hole = square(4.0, 4.0, 6.0, 6.0);
+        let subpaths = [outer.as_slice(), hole.as_slice()];
+
+        let infill = parallel_infill_all(&subpaths, 2.0, 0.0);
+        let middle: Vec<&Polyline> = infill
+            .iter()
+            .filter(|pl| (pl[0].y - 5.0).abs() < 1e-9)
+            .collect();
+
+        assert_eq!(middle.len(), 2);
+        assert_eq!((middle[0][0].x, middle[0][1].x), (0.0, 4.0));
+        assert_eq!((middle[1][0].x, middle[1][1].x), (6.0, 10.0));
+    }
+
+    #[test]
+    fn reversed_scan_line_reverses_segment_order_too() {
+        let outer = square(0.0, 0.0, 10.0, 10.0);
+        let hole = square(4.0, 2.0, 6.0, 4.0);
+        let subpaths = [outer.as_slice(), hole.as_slice()];
+
+        let infill = parallel_infill_all(&subpaths, 2.0, 0.0);
+        let reversed: Vec<&Polyline> = infill
+            .iter()
+            .filter(|pl| (pl[0].y - 3.0).abs() < 1e-9)
+            .collect();
+
+        assert_eq!(reversed.len(), 2);
+        assert_eq!((reversed[0][0].x, reversed[0][1].x), (10.0, 6.0));
+        assert_eq!((reversed[1][0].x, reversed[1][1].x), (4.0, 0.0));
+    }
+
+    #[test]
+    fn cavalier_arcs_are_flattened_before_gcode_conversion() {
+        let mut pl = CcPolyline::new_closed();
+        pl.add(0.0, 0.0, 1.0); // semicircle from (0, 0) to (2, 0)
+        pl.add(2.0, 0.0, 0.0);
+
+        let converted = cc_polyline_to_polyline(&pl, 0.01);
+
+        assert!(converted.len() > 3);
+        assert_eq!(converted.first(), converted.last());
+        assert!(converted.iter().any(|p| p.y.abs() > 0.5));
+    }
+
+    #[test]
+    fn concentric_toolpath_validation_rejects_hole_crossing() {
+        let outer = square(0.0, 0.0, 10.0, 10.0);
+        let hole = square(4.0, 4.0, 6.0, 6.0);
+        let subpaths = [outer.as_slice(), hole.as_slice()];
+        let crossing = Polyline::from_vec(vec![
+            CoordinatePair::new(2.0, 5.0),
+            CoordinatePair::new(8.0, 5.0),
+        ]);
+        let safe = Polyline::from_vec(vec![
+            CoordinatePair::new(1.0, 5.0),
+            CoordinatePair::new(3.0, 5.0),
+        ]);
+
+        assert!(!polyline_stays_in_fill(&crossing, &subpaths, 0.25));
+        assert!(polyline_stays_in_fill(&safe, &subpaths, 0.25));
+    }
+
+    #[test]
+    fn concentric_infill_stays_out_of_compound_path_hole() {
+        let outer = square(0.0, 0.0, 20.0, 20.0);
+        let hole = square(8.0, 8.0, 12.0, 12.0);
+        let subpaths = [outer.as_slice(), hole.as_slice()];
+
+        let rings = shape_concentric_infill(&subpaths, &[0, 1], 1.0);
+
+        assert!(rings.len() > 2);
+        assert!(
+            rings
+                .iter()
+                .all(|ring| polyline_stays_in_fill(ring, &subpaths, 0.25))
+        );
+    }
+}
