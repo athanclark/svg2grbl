@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="8mm" height="4mm" viewBox="0 0 8 4">
+  <!-- An embedded PNG: black, gray, white, transparent, red, lime, blue,
+       and half-transparent black columns. Each source pixel spans 1 mm. -->
+  <image width="8" height="4" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAECAYAAACzzX7wAAAAIElEQVR4nGNgYGD439DQ8B8EGEAcEPoPpkD8BgbaKwAAnN430dA0z7wAAAAASUVORK5CYII="/>
+</svg>

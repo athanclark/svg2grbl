@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="70mm" height="10mm" viewBox="0 0 70 10">
+  <!-- Black, gray, white, red, lime, blue, and half-transparent black. -->
+  <path d="M 1 1 H 9 V 9 H 1 Z" fill="black"/>
+  <path d="M 11 1 H 19 V 9 H 11 Z" fill="#808080"/>
+  <path d="M 21 1 H 29 V 9 H 21 Z" fill="white"/>
+  <path d="M 31 1 H 39 V 9 H 31 Z" fill="red"/>
+  <path d="M 41 1 H 49 V 9 H 41 Z" fill="lime"/>
+  <path d="M 51 1 H 59 V 9 H 51 Z" fill="blue"/>
+  <path d="M 61 1 H 69 V 9 H 61 Z" fill="rgba(0, 0, 0, 0.5)"/>
+</svg>

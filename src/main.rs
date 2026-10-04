@@ -15,6 +15,8 @@ use std::{
 use svg2polylines::{CoordinatePair, Polyline, StyledPath};
 use svgtypes::{Length, LengthUnit, TransformListParser, TransformListToken, ViewBox};
 
+mod raster;
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -34,7 +36,7 @@ struct Args {
     #[arg(short, long, default_value_t = 0.15)]
     tolerance: f64,
 
-    /// The maximum size of a linear line - smaller ensures smoother transition between strengths
+    /// Maximum raster sampling segment length in mm (also split at pixel boundaries)
     #[arg(short, long, default_value_t = 2.0)]
     max_line: f64,
 
@@ -46,7 +48,7 @@ struct Args {
     #[arg(long, default_value_t = 500.0)]
     strength: f64,
     
-    /// Speed of the engraver (`S` argument during engraving movements - found using `$$` in the machine's console, and looking at the `$110` and `$111` values)
+    /// Engraving feed rate in mm/min (`F` argument during engraving movements)
     #[arg(long, default_value_t = 500.0)]
     speed: f64,
 
@@ -58,7 +60,7 @@ struct Args {
     #[arg(long, default_value_t = 16.0)]
     font_size: f64,
 
-    /// Spacing (in mm) between infill passes for filled paths. Holes are
+    /// Spacing (in mm) between infill passes for filled paths and images. Holes are
     /// detected via subpath containment (so glyphs with holes work
     /// correctly), and concentric offsets are robust on non-convex outlines.
     /// If unset, no infill is generated.
@@ -84,8 +86,6 @@ struct Args {
     /// step. Ignored for other patterns.
     #[arg(long)]
     infill_wave_period: Option<f64>,
-
-    // TODO: Fill type? Gradients? etc
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -103,7 +103,13 @@ enum InfillPattern {
 fn main() -> io::Result<()> {
     env_logger::init();
     let args = Args::parse();
+    validate_args(&args)?;
 
+    let image_base_dir = args
+        .svg
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from);
     let mut svg_source = open_input(args.svg)?;
     let mut svg_buf = String::new();
     svg_source.read_to_string(&mut svg_buf)?;
@@ -129,6 +135,15 @@ fn main() -> io::Result<()> {
     let width = svg_node.attribute("width").map(|w| length_to_mm(w, args.dpi, args.font_size)).transpose().map_err(io::Error::other).map(|w| w.unwrap_or(viewbox.w))?;
     info!("Extracting height");
     let height = svg_node.attribute("height").map(|h| length_to_mm(h, args.dpi, args.font_size)).transpose().map_err(io::Error::other).map(|h| h.unwrap_or(viewbox.h))?;
+    if ![viewbox.w, viewbox.h, width, height]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SVG dimensions must be finite and positive",
+        ));
+    }
 
     let paths: Vec<StyledPath> = svg2polylines::parse_paths(
         &svg_buf,
@@ -181,12 +196,27 @@ fn main() -> io::Result<()> {
     // Expand each StyledPath into the polylines to engrave, each tagged
     // with the laser power derived from its source color (or gradient
     // sampled at the polyline's centroid).
-    let polylines: Vec<PoweredPolyline> = paths
+    let mut polylines: Vec<PoweredPolyline> = paths
         .into_iter()
         .flat_map(|sp| {
             expand_path_with_infill(sp, infill_spec.as_ref(), args.strength, &gradients)
         })
         .collect();
+
+    polylines.extend(raster::image_toolpaths(
+        &doc,
+        &raster::ImageContext {
+            viewbox: &viewbox,
+            width_mm: width,
+            height_mm: height,
+            dpi: args.dpi,
+            font_size: args.font_size,
+            base_dir: image_base_dir.as_deref(),
+        },
+        infill_spec.as_ref(),
+        args.strength,
+        args.max_line,
+    )?);
 
     let points: Vec<CoordinatePair> = polylines
         .iter()
@@ -208,7 +238,10 @@ fn main() -> io::Result<()> {
                 })
                 .collect()
         );
-        let mut gcodes_to_append = polyline2gcode(polyline, pp.power, args.speed)?;
+        let mut gcodes_to_append = match pp.power {
+            LaserPower::Uniform(power) => polyline2gcode(polyline, power, args.speed)?,
+            LaserPower::Segments(powers) => segmented_polyline2gcode(polyline, &powers, args.speed)?,
+        };
         gcodes.append(&mut gcodes_to_append);
     }
 
@@ -220,6 +253,49 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn validate_args(args: &Args) -> io::Result<()> {
+    for (name, value) in [
+        ("tolerance", args.tolerance),
+        ("max-line", args.max_line),
+        ("speed", args.speed),
+        ("dpi", args.dpi),
+        ("font-size", args.font_size),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--{name} must be finite and positive"),
+            ));
+        }
+    }
+    if !args.strength.is_finite() || args.strength < 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--strength must be finite and non-negative",
+        ));
+    }
+    if !args.infill_angle.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--infill-angle must be finite",
+        ));
+    }
+    for (name, value, allow_zero) in [
+        ("infill", args.infill, false),
+        ("infill-wave-amplitude", args.infill_wave_amplitude, true),
+        ("infill-wave-period", args.infill_wave_period, false),
+    ] {
+        if value.is_some_and(|v| !v.is_finite() || v < 0.0 || (!allow_zero && v == 0.0)) {
+            let requirement = if allow_zero { "non-negative" } else { "positive" };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--{name} must be finite and {requirement}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn open_input(path: Option<PathBuf>) -> io::Result<Box<dyn Read>> {
     match path {
         None => Ok(Box::new(io::stdin())),
@@ -228,6 +304,18 @@ fn open_input(path: Option<PathBuf>) -> io::Result<Box<dyn Read>> {
 }
 
 fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<Vec<String>> {
+    let powers = vec![strength; polyline.as_ref().len().saturating_sub(1)];
+    segmented_polyline2gcode(polyline, &powers, speed)
+}
+
+/// A power value applies to the movement ending at the corresponding vertex.
+/// Zero-power raster segments remain G1 movements so blank pixels are traversed
+/// without carrying the preceding pixel's modal S value.
+fn segmented_polyline2gcode(
+    polyline: Polyline,
+    powers: &[f64],
+    speed: f64,
+) -> io::Result<Vec<String>> {
     let coordinates: Vec<CoordinatePair> = polyline.unwrap();
     
     if coordinates.len() < 2 {
@@ -237,6 +325,12 @@ fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<V
                 format!("Polyline with less than 2 coordinates: {coordinates:?}")
             )
         );
+    }
+    if powers.len() != coordinates.len() - 1 || powers.iter().any(|p| !p.is_finite() || *p < 0.0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "A finite, non-negative power is required for each polyline segment",
+        ));
     }
 
     let mut gcodes = vec![];
@@ -252,7 +346,7 @@ fn polyline2gcode(polyline: Polyline, strength: f64, speed: f64) -> io::Result<V
     // S is modal.  Set it to zero when arming M4 so a previous polyline's
     // power cannot burn a stationary dot before the first G1 begins.
     gcodes.push("M4 S0".to_owned());
-    for next_coord in &coordinates[1..] {
+    for (next_coord, strength) in coordinates[1..].iter().zip(powers) {
         gcodes.push(format!("G1 X{} Y{} F{speed} S{strength}", next_coord.x, next_coord.y));
     }
     // Clear modal power before stopping the laser. Some controllers/senders
@@ -275,14 +369,18 @@ struct InfillSpec {
     wave_period: f64,
 }
 
-/// A polyline together with the laser-S value to engrave it at. Polylines
-/// whose computed power is non-positive are filtered out before this struct
-/// is built, so `power > 0.0` is an invariant for anything that reaches the
-/// G-code emitter.
+/// A vector's uniform power or a raster's power for each movement.
+#[derive(Debug, Clone)]
+enum LaserPower {
+    Uniform(f64),
+    Segments(Vec<f64>),
+}
+
+/// At least one segment must have positive power; entirely blank passes are skipped.
 #[derive(Debug, Clone)]
 struct PoweredPolyline {
     polyline: Polyline,
-    power: f64,
+    power: LaserPower,
 }
 
 /// Where a gradient's geometric attributes (`x1`, `cx`, etc.) live.
@@ -403,16 +501,10 @@ impl Affine {
 
 /// Parse a CSS/SVG transform-list string (`"translate(10) rotate(45)"`,
 /// `"matrix(a b c d e f)"`, etc.) into a single affine.
-fn parse_gradient_transform(s: &str) -> Affine {
+fn parse_transform(s: &str) -> Result<Affine, svgtypes::Error> {
     let mut m = Affine::identity();
     for tok in TransformListParser::from(s) {
-        let tok = match tok {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Skipping malformed gradientTransform token: {}", e);
-                break;
-            }
-        };
+        let tok = tok?;
         let t = match tok {
             TransformListToken::Matrix { a, b, c, d, e, f } => Affine { a, b, c, d, e, f },
             TransformListToken::Translate { tx, ty } => Affine {
@@ -462,7 +554,7 @@ fn parse_gradient_transform(s: &str) -> Affine {
         };
         m = m.compose(&t);
     }
-    m
+    Ok(m)
 }
 
 type GradientRegistry = HashMap<String, Gradient>;
@@ -934,7 +1026,12 @@ fn parse_gradients(
         let transform = g
             .transform
             .as_deref()
-            .map(parse_gradient_transform)
+            .map(|s| {
+                parse_transform(s).unwrap_or_else(|e| {
+                    warn!("Malformed gradientTransform: {}; using identity", e);
+                    Affine::identity()
+                })
+            })
             .unwrap_or_else(Affine::identity);
 
         // Convert coords to mm when in user space, matching what we do to
@@ -1109,7 +1206,10 @@ fn expand_path_with_infill(
         };
         let power = power_from_color(color, max_power, &env);
         if power > 0.0 {
-            Some(PoweredPolyline { polyline, power })
+            Some(PoweredPolyline {
+                polyline,
+                power: LaserPower::Uniform(power),
+            })
         } else {
             None
         }

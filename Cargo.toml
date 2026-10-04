@@ -2,12 +2,15 @@
 name = "svg2grbl"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
+base64 = "0.22"
 cavalier_contours = "0.7"
 clap = { version = "4.6.0", features = ["derive"] }
 csscolorparser = "0.8"
 env_logger = "0.11.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log = "0.4.29"
 roxmltree = "0.21.1"
 svg2polylines = { path = "../svg2polylines" }
