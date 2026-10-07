@@ -727,6 +727,7 @@ dependencies = [
  "roxmltree 0.21.1",
  "svg2polylines",
  "svgtypes 0.16.1",
+ "usvg",
 ]
 
 [[package]]

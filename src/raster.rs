@@ -11,7 +11,7 @@ use svgtypes::{Align, AspectRatio, Length, LengthUnit, ViewBox};
 use crate::{
     Affine, Bbox, CoordinatePair, InfillPattern, InfillSpec, LaserPower, Polyline, PoweredPolyline,
     length_to_mm, parallel_infill_all, parse_transform, rgba_to_power, shape_concentric_infill,
-    wavy_infill_all,
+    viewbox_to_mm, wavy_infill_all,
 };
 
 pub(crate) struct ImageContext<'a> {
@@ -196,11 +196,7 @@ fn parse_image(node: Node, context: &ImageContext) -> io::Result<Option<RasterIm
             );
         }
     }
-    let normalize = Affine {
-        a: context.width_mm / context.viewbox.w,
-        d: context.height_mm / context.viewbox.h,
-        ..Affine::identity()
-    };
+    let normalize = viewbox_to_mm(context.viewbox, context.width_mm, context.height_mm);
     let pixel_to_mm = normalize.compose(&transform).compose(&Affine {
         a: sx,
         d: sy,

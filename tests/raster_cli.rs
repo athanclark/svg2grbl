@@ -174,6 +174,49 @@ fn image_and_vector_toolpaths_share_the_drawing_origin() {
 }
 
 #[test]
+fn image_and_vector_toolpaths_share_a_nonzero_viewbox_origin() {
+    let original = SVG.replace(
+        "</svg>",
+        r#"<path d="M 1 1 H 3" fill="none" stroke="black"/></svg>"#,
+    );
+    let shifted = original
+        .replace("viewBox=\"0 0 8 4\"", "viewBox=\"-10 -20 8 4\"")
+        .replace("<image", "<g transform=\"matrix(1 0 0 1 -10 -20)\"><image")
+        .replace("</svg>", "</g></svg>");
+    assert_ne!(original, shifted);
+    for preprocess in [false, true] {
+        let mut args = vec!["--infill", "1", "--infill-pattern", "parallel"];
+        if preprocess {
+            args.push("--preprocess");
+        }
+        // Raw vector parsing only applies path transforms, so give the path
+        // its own matrix and keep the image's transform on its parent group.
+        let shifted = if preprocess {
+            shifted.clone()
+        } else {
+            shifted.replace("<path", "<path transform=\"matrix(1 0 0 1 -10 -20)\"")
+        };
+        let expected = movements(&run_stdin(&original, &args));
+        let actual = movements(&run_stdin(&shifted, &args));
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual.0 - expected.0).abs() < 1e-8,
+                "{actual:?} != {expected:?}"
+            );
+            assert!(
+                (actual.1 - expected.1).abs() < 1e-8,
+                "{actual:?} != {expected:?}"
+            );
+            assert!(
+                (actual.2 - expected.2).abs() < 1e-4,
+                "{actual:?} != {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn image_physical_lengths_match_vector_shapes_in_a_scaled_viewbox() {
     let href = roxmltree::Document::parse(SVG)
         .unwrap()

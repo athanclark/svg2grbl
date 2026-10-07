@@ -16,6 +16,7 @@ use svg2polylines::{CoordinatePair, Polyline, StyledPath};
 use svgtypes::{Length, LengthUnit, TransformListParser, TransformListToken, ViewBox};
 
 mod raster;
+mod vector;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -145,12 +146,13 @@ fn main() -> io::Result<()> {
         ));
     }
 
-    let paths: Vec<StyledPath> = svg2polylines::parse_paths(
+    let paths = vector::parse_paths(
         &svg_buf,
         args.tolerance,
         args.preprocess,
-    )
-    .map_err(io::Error::other)?;
+        args.dpi,
+        args.font_size,
+    )?;
 
     let mut gcodes: Vec<String> = vec![
         "G21".to_owned(), // use millimeters
@@ -161,9 +163,10 @@ fn main() -> io::Result<()> {
     ];
 
     // Normalize coordinates of every polyline within every path to mm.
-    let normalize = |p: CoordinatePair| CoordinatePair {
-        x: (p.x / viewbox.w) * width,
-        y: (p.y / viewbox.h) * height,
+    let svg_to_mm = viewbox_to_mm(&viewbox, width, height);
+    let normalize = |p: CoordinatePair| {
+        let (x, y) = svg_to_mm.apply(p.x, p.y);
+        CoordinatePair { x, y }
     };
     let paths: Vec<StyledPath> = paths
         .into_iter()
@@ -388,8 +391,7 @@ struct PoweredPolyline {
 enum GradientUnits {
     /// Default per the SVG spec: coordinates are 0..1 within the path's bbox.
     ObjectBoundingBox,
-    /// Coordinates are in user space (mm here, since we normalise both
-    /// gradient and polyline coordinates the same way).
+    /// Coordinates are in SVG user space; the gradient transform maps them to mm.
     UserSpaceOnUse,
 }
 
@@ -430,9 +432,8 @@ struct Gradient {
     stops: Vec<GradientStop>,
     units: GradientUnits,
     spread: SpreadMethod,
-    /// `gradientTransform` mapping from the gradient's local coordinate
-    /// system to the target system (mm for userSpaceOnUse, or bbox-unit for
-    /// objectBoundingBox). Identity if none was specified.
+    /// Map gradient-local coordinates to mm for userSpaceOnUse (including the
+    /// root viewBox mapping), or bbox units for objectBoundingBox.
     transform: Affine,
 }
 
@@ -496,6 +497,20 @@ impl Affine {
             e: (self.c * self.f - self.d * self.e) / det,
             f: (self.b * self.e - self.a * self.f) / det,
         })
+    }
+}
+
+/// Map root SVG user coordinates to page millimeters. The viewBox's minimum
+/// coordinates identify the page's top-left, even when they are negative.
+fn viewbox_to_mm(viewbox: &ViewBox, width_mm: f64, height_mm: f64) -> Affine {
+    let sx = width_mm / viewbox.w;
+    let sy = height_mm / viewbox.h;
+    Affine {
+        a: sx,
+        d: sy,
+        e: -viewbox.x * sx,
+        f: -viewbox.y * sy,
+        ..Affine::identity()
     }
 }
 
@@ -998,7 +1013,7 @@ fn parse_gradients(
         }
     }
 
-    // Third pass: apply spec defaults, normalise userSpaceOnUse to mm,
+    // Third pass: apply spec defaults, map userSpaceOnUse to mm,
     // build the final Gradient values.
     let mut registry: GradientRegistry = HashMap::new();
     for (id, g) in raw {
@@ -1023,7 +1038,7 @@ fn parse_gradients(
         let (cx, cy, r) = (g.cx.unwrap_or(0.5), g.cy.unwrap_or(0.5), g.r.unwrap_or(0.5));
         let (fx, fy) = (g.fx.unwrap_or(cx), g.fy.unwrap_or(cy));
 
-        let transform = g
+        let mut transform = g
             .transform
             .as_deref()
             .map(|s| {
@@ -1034,39 +1049,16 @@ fn parse_gradients(
             })
             .unwrap_or_else(Affine::identity);
 
-        // Convert coords to mm when in user space, matching what we do to
-        // polylines elsewhere.
-        let scale_to_mm = |x: f64, y: f64| -> (f64, f64) {
-            match units {
-                GradientUnits::UserSpaceOnUse => (
-                    (x / viewbox.w) * width_mm,
-                    (y / viewbox.h) * height_mm,
-                ),
-                GradientUnits::ObjectBoundingBox => (x, y),
-            }
-        };
-        let scale_len = |v: f64| -> f64 {
-            // Radial r in userSpaceOnUse units: scale by an average of x/y
-            // factors. Anisotropic SVGs are rare; this matches the common
-            // case where width/height share the same per-mm scale.
-            match units {
-                GradientUnits::UserSpaceOnUse => {
-                    let sx = width_mm / viewbox.w;
-                    let sy = height_mm / viewbox.h;
-                    v * 0.5 * (sx + sy)
-                }
-                GradientUnits::ObjectBoundingBox => v,
-            }
-        };
+        // Keep gradient geometry in its local units and map it through the
+        // same page transform as paths and images. Inverse sampling then also
+        // handles the viewBox offset and any gradientTransform translation.
+        if units == GradientUnits::UserSpaceOnUse {
+            transform = viewbox_to_mm(viewbox, width_mm, height_mm).compose(&transform);
+        }
 
         let shape = if g.is_linear {
-            let (x1, y1) = scale_to_mm(x1, y1);
-            let (x2, y2) = scale_to_mm(x2, y2);
             GradientShape::Linear { x1, y1, x2, y2 }
         } else {
-            let (cx, cy) = scale_to_mm(cx, cy);
-            let (fx, fy) = scale_to_mm(fx, fy);
-            let r = scale_len(r);
             GradientShape::Radial { cx, cy, fx, fy, r }
         };
 

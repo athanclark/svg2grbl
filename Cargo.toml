@@ -15,6 +15,7 @@ log = "0.4.29"
 roxmltree = "0.21.1"
 svg2polylines = { path = "../svg2polylines" }
 svgtypes = "0.16.1"
+usvg = "0.23"
 
 # cavalier_contours (and its transitive dep static_aabb2d_index) sprinkle
 # debug_assert!s through their offset / spatial-index code that catch

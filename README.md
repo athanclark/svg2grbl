@@ -76,8 +76,10 @@ Without `--preprocess`, the converter reads `<path>` elements and styles set
 directly on those paths, including inline `style` declarations. Path transforms
 are applied, but inherited group styles and group transforms are not resolved.
 Use `--preprocess` to normalize an SVG through `usvg`, resolve inherited styles,
-and convert basic shapes such as rectangles and circles to paths. Convert text
-to paths in your editor before exporting.
+and convert basic shapes such as rectangles and circles to paths. The converter
+applies cumulative transforms even when preprocessing retains groups for clip
+paths, masks, filters, or opacity. Paths inside definitions are excluded from
+engraving. Convert text to paths in your editor before exporting.
 
 ### Dimensions and origin
 
@@ -90,10 +92,12 @@ to paths in your editor before exporting.
 - The Y axis is flipped so the SVG's bottom corresponds to the machine's lower
   edge. By default the drawing keeps its position within the SVG page;
   `--reset-origin` places the bottom-left of the generated engraving at `(0, 0)`.
+- The `viewBox` origin is subtracted before scaling to millimeters, including
+  negative origins. Paths, images, and user-space gradients share this mapping.
 
-For predictable scaling, use a `viewBox` starting at `0 0` whose aspect ratio
-matches `width` and `height`. The current conversion scales X and Y independently
-and does not subtract a nonzero `viewBox` origin or implement `preserveAspectRatio`.
+For predictable scaling, use a `viewBox` whose aspect ratio matches `width` and
+`height`. The root page mapping scales X and Y independently and does not
+implement the root `preserveAspectRatio` attribute.
 
 ## Fill colors, grayscale, and intensity
 
